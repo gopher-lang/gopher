@@ -12,7 +12,25 @@
 
 package syscall
 
-import "unsafe"
+import (
+	"sync"
+	"unsafe"
+)
+
+// See version list in https://github.com/DragonFlyBSD/DragonFlyBSD/blob/master/sys/sys/param.h
+var (
+	osreldateOnce sync.Once
+	osreldate     uint32
+)
+
+// First __DragonFly_version after September 2019 ABI changes
+// http://lists.dragonflybsd.org/pipermail/users/2019-September/358280.html
+const _dragonflyABIChangeVersion = 500705
+
+func supportsABI(ver uint32) bool {
+	osreldateOnce.Do(func() { osreldate, _ = SysctlUint32("kern.osreldate") })
+	return osreldate >= ver
+}
 
 type SockaddrDatalink struct {
 	Len    uint8
@@ -80,6 +98,19 @@ func Pipe(p []int) (err error) {
 	}
 	p[0], p[1], err = pipe()
 	return
+}
+
+//sysnb	pipe2(p *[2]_C_int, flags int) (r int, w int, err error)
+
+func Pipe2(p []int, flags int) (err error) {
+	if len(p) != 2 {
+		return EINVAL
+	}
+	var pp [2]_C_int
+	// pipe2 on dragonfly takes an fds array as an argument, but still
+	// returns the file descriptors.
+	p[0], p[1], err = pipe2(&pp, flags)
+	return err
 }
 
 //sys	extpread(fd int, p []byte, flags int, offset int64) (n int, err error)
@@ -217,3 +248,4 @@ func setattrlistTimes(path string, times []Timespec) error {
 //sys	accept4(fd int, rsa *RawSockaddrAny, addrlen *_Socklen, flags int) (nfd int, err error)
 //sys	utimensat(dirfd int, path string, times *[2]Timespec, flag int) (err error)
 //sys	getcwd(buf []byte) (n int, err error) = SYS___GETCWD
+//sys	sysctl(mib []_C_int, old *byte, oldlen *uintptr, new *byte, newlen uintptr) (err error) = SYS___SYSCTL

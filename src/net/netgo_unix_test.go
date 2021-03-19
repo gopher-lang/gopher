@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build (!cgo || netgo) && (darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris)
 // +build !cgo netgo
 // +build darwin dragonfly freebsd linux netbsd openbsd solaris
 
@@ -16,7 +17,7 @@ func TestGoLookupIP(t *testing.T) {
 	defer dnsWaitGroup.Wait()
 	host := "localhost"
 	ctx := context.Background()
-	_, err, ok := cgoLookupIP(ctx, host)
+	_, err, ok := cgoLookupIP(ctx, "ip", host)
 	if ok {
 		t.Errorf("cgoLookupIP must be a placeholder")
 	}

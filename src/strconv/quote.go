@@ -7,11 +7,13 @@
 package strconv
 
 import (
-	"internal/bytealg"
 	"unicode/utf8"
 )
 
-const lowerhex = "0123456789abcdef"
+const (
+	lowerhex = "0123456789abcdef"
+	upperhex = "0123456789ABCDEF"
+)
 
 func quoteWith(s string, quote byte, ASCIIonly, graphicOnly bool) string {
 	return string(appendQuotedWith(make([]byte, 0, 3*len(s)/2), s, quote, ASCIIonly, graphicOnly))
@@ -22,6 +24,13 @@ func quoteRuneWith(r rune, quote byte, ASCIIonly, graphicOnly bool) string {
 }
 
 func appendQuotedWith(buf []byte, s string, quote byte, ASCIIonly, graphicOnly bool) []byte {
+	// Often called with big strings, so preallocate. If there's quoting,
+	// this is conservative but still helps a lot.
+	if cap(buf)-len(buf) < len(s) {
+		nBuf := make([]byte, len(buf), len(buf)+1+len(s)+1)
+		copy(nBuf, buf)
+		buf = nBuf
+	}
 	buf = append(buf, quote)
 	for width := 0; len(s) > 0; s = s[width:] {
 		r := rune(s[0])
@@ -135,8 +144,9 @@ func AppendQuoteToASCII(dst []byte, s string) []byte {
 }
 
 // QuoteToGraphic returns a double-quoted Go string literal representing s.
-// The returned string uses Go escape sequences (\t, \n, \xFF, \u0100) for
-// non-ASCII characters and non-printable characters as defined by IsGraphic.
+// The returned string leaves Unicode graphic characters, as defined by
+// IsGraphic, unchanged and uses Go escape sequences (\t, \n, \xFF, \u0100)
+// for non-graphic characters.
 func QuoteToGraphic(s string) string {
 	return quoteWith(s, '"', false, true)
 }
@@ -175,9 +185,9 @@ func AppendQuoteRuneToASCII(dst []byte, r rune) []byte {
 }
 
 // QuoteRuneToGraphic returns a single-quoted Go character literal representing
-// the rune. The returned string uses Go escape sequences (\t, \n, \xFF,
-// \u0100) for non-ASCII characters and non-printable characters as defined
-// by IsGraphic.
+// the rune. If the rune is not a Unicode graphic character,
+// as defined by IsGraphic, the returned string will use a Go escape sequence
+// (\t, \n, \xFF, \u0100).
 func QuoteRuneToGraphic(r rune) string {
 	return quoteRuneWith(r, '\'', false, true)
 }
@@ -425,17 +435,12 @@ func Unquote(s string) (string, error) {
 	return string(buf), nil
 }
 
-// contains reports whether the string contains the byte c.
-func contains(s string, c byte) bool {
-	return bytealg.IndexByteString(s, c) != -1
-}
-
 // bsearch16 returns the smallest i such that a[i] >= x.
 // If there is no such i, bsearch16 returns len(a).
 func bsearch16(a []uint16, x uint16) int {
 	i, j := 0, len(a)
 	for i < j {
-		h := i + (j-i)/2
+		h := i + (j-i)>>1
 		if a[h] < x {
 			i = h + 1
 		} else {
@@ -450,7 +455,7 @@ func bsearch16(a []uint16, x uint16) int {
 func bsearch32(a []uint32, x uint32) int {
 	i, j := 0, len(a)
 	for i < j {
-		h := i + (j-i)/2
+		h := i + (j-i)>>1
 		if a[h] < x {
 			i = h + 1
 		} else {

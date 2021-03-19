@@ -6,7 +6,6 @@ package runtime
 
 import (
 	"runtime/internal/atomic"
-	"runtime/internal/sys"
 	"unsafe"
 )
 
@@ -18,7 +17,7 @@ const (
 // Don't split the stack as this method may be invoked without a valid G, which
 // prevents us from allocating more stack.
 //go:nosplit
-func sysAlloc(n uintptr, sysStat *uint64) unsafe.Pointer {
+func sysAlloc(n uintptr, sysStat *sysMemStat) unsafe.Pointer {
 	p, err := mmap(nil, n, _PROT_READ|_PROT_WRITE, _MAP_ANON|_MAP_PRIVATE, -1, 0)
 	if err != 0 {
 		if err == _EACCES {
@@ -31,7 +30,7 @@ func sysAlloc(n uintptr, sysStat *uint64) unsafe.Pointer {
 		}
 		return nil
 	}
-	mSysStatInc(sysStat, n)
+	sysStat.add(int64(n))
 	return p
 }
 
@@ -63,37 +62,35 @@ func sysUnused(v unsafe.Pointer, n uintptr) {
 	// gets most of the benefit of huge pages while keeping the
 	// number of VMAs under control. With hugePageSize = 2MB, even
 	// a pessimal heap can reach 128GB before running out of VMAs.
-	if sys.HugePageSize != 0 {
-		var s uintptr = sys.HugePageSize // division by constant 0 is a compile-time error :(
-
+	if physHugePageSize != 0 {
 		// If it's a large allocation, we want to leave huge
 		// pages enabled. Hence, we only adjust the huge page
 		// flag on the huge pages containing v and v+n-1, and
 		// only if those aren't aligned.
 		var head, tail uintptr
-		if uintptr(v)%s != 0 {
+		if uintptr(v)&(physHugePageSize-1) != 0 {
 			// Compute huge page containing v.
-			head = uintptr(v) &^ (s - 1)
+			head = alignDown(uintptr(v), physHugePageSize)
 		}
-		if (uintptr(v)+n)%s != 0 {
+		if (uintptr(v)+n)&(physHugePageSize-1) != 0 {
 			// Compute huge page containing v+n-1.
-			tail = (uintptr(v) + n - 1) &^ (s - 1)
+			tail = alignDown(uintptr(v)+n-1, physHugePageSize)
 		}
 
 		// Note that madvise will return EINVAL if the flag is
 		// already set, which is quite likely. We ignore
 		// errors.
-		if head != 0 && head+sys.HugePageSize == tail {
+		if head != 0 && head+physHugePageSize == tail {
 			// head and tail are different but adjacent,
 			// so do this in one call.
-			madvise(unsafe.Pointer(head), 2*sys.HugePageSize, _MADV_NOHUGEPAGE)
+			madvise(unsafe.Pointer(head), 2*physHugePageSize, _MADV_NOHUGEPAGE)
 		} else {
 			// Advise the huge pages containing v and v+n-1.
 			if head != 0 {
-				madvise(unsafe.Pointer(head), sys.HugePageSize, _MADV_NOHUGEPAGE)
+				madvise(unsafe.Pointer(head), physHugePageSize, _MADV_NOHUGEPAGE)
 			}
 			if tail != 0 && tail != head {
-				madvise(unsafe.Pointer(tail), sys.HugePageSize, _MADV_NOHUGEPAGE)
+				madvise(unsafe.Pointer(tail), physHugePageSize, _MADV_NOHUGEPAGE)
 			}
 		}
 	}
@@ -105,7 +102,12 @@ func sysUnused(v unsafe.Pointer, n uintptr) {
 		throw("unaligned sysUnused")
 	}
 
-	advise := atomic.Load(&adviseUnused)
+	var advise uint32
+	if debug.madvdontneed != 0 {
+		advise = _MADV_DONTNEED
+	} else {
+		advise = atomic.Load(&adviseUnused)
+	}
 	if errno := madvise(v, n, int32(advise)); advise == _MADV_FREE && errno != 0 {
 		// MADV_FREE was added in Linux 4.5. Fall back to MADV_DONTNEED if it is
 		// not supported.
@@ -115,21 +117,23 @@ func sysUnused(v unsafe.Pointer, n uintptr) {
 }
 
 func sysUsed(v unsafe.Pointer, n uintptr) {
-	if sys.HugePageSize != 0 {
-		// Partially undo the NOHUGEPAGE marks from sysUnused
-		// for whole huge pages between v and v+n. This may
-		// leave huge pages off at the end points v and v+n
-		// even though allocations may cover these entire huge
-		// pages. We could detect this and undo NOHUGEPAGE on
-		// the end points as well, but it's probably not worth
-		// the cost because when neighboring allocations are
-		// freed sysUnused will just set NOHUGEPAGE again.
-		var s uintptr = sys.HugePageSize
+	// Partially undo the NOHUGEPAGE marks from sysUnused
+	// for whole huge pages between v and v+n. This may
+	// leave huge pages off at the end points v and v+n
+	// even though allocations may cover these entire huge
+	// pages. We could detect this and undo NOHUGEPAGE on
+	// the end points as well, but it's probably not worth
+	// the cost because when neighboring allocations are
+	// freed sysUnused will just set NOHUGEPAGE again.
+	sysHugePage(v, n)
+}
 
+func sysHugePage(v unsafe.Pointer, n uintptr) {
+	if physHugePageSize != 0 {
 		// Round v up to a huge page boundary.
-		beg := (uintptr(v) + (s - 1)) &^ (s - 1)
+		beg := alignUp(uintptr(v), physHugePageSize)
 		// Round v+n down to a huge page boundary.
-		end := (uintptr(v) + n) &^ (s - 1)
+		end := alignDown(uintptr(v)+n, physHugePageSize)
 
 		if beg < end {
 			madvise(unsafe.Pointer(beg), end-beg, _MADV_HUGEPAGE)
@@ -140,8 +144,8 @@ func sysUsed(v unsafe.Pointer, n uintptr) {
 // Don't split the stack as this function may be invoked without a valid G,
 // which prevents us from allocating more stack.
 //go:nosplit
-func sysFree(v unsafe.Pointer, n uintptr, sysStat *uint64) {
-	mSysStatDec(sysStat, n)
+func sysFree(v unsafe.Pointer, n uintptr, sysStat *sysMemStat) {
+	sysStat.add(-int64(n))
 	munmap(v, n)
 }
 
@@ -157,8 +161,8 @@ func sysReserve(v unsafe.Pointer, n uintptr) unsafe.Pointer {
 	return p
 }
 
-func sysMap(v unsafe.Pointer, n uintptr, sysStat *uint64) {
-	mSysStatInc(sysStat, n)
+func sysMap(v unsafe.Pointer, n uintptr, sysStat *sysMemStat) {
+	sysStat.add(int64(n))
 
 	p, err := mmap(v, n, _PROT_READ|_PROT_WRITE, _MAP_ANON|_MAP_FIXED|_MAP_PRIVATE, -1, 0)
 	if err == _ENOMEM {

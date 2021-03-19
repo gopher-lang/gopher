@@ -5,6 +5,7 @@
 package runtime
 
 import (
+	"runtime/internal/sys"
 	"unsafe"
 )
 
@@ -38,8 +39,23 @@ func initExceptionHandler() {
 	}
 }
 
-// isgoexception returns true if this exception should be translated
-// into a Go panic.
+// isAbort returns true, if context r describes exception raised
+// by calling runtime.abort function.
+//
+//go:nosplit
+func isAbort(r *context) bool {
+	pc := r.ip()
+	if GOARCH == "386" || GOARCH == "amd64" || GOARCH == "arm" {
+		// In the case of an abort, the exception IP is one byte after
+		// the INT3 (this differs from UNIX OSes). Note that on ARM,
+		// this means that the exception IP is no longer aligned.
+		pc--
+	}
+	return isAbortPC(pc)
+}
+
+// isgoexception reports whether this exception should be translated
+// into a Go panic or throw.
 //
 // It is nosplit to avoid growing the stack in case we're aborting
 // because of a stack overflow.
@@ -50,13 +66,6 @@ func isgoexception(info *exceptionrecord, r *context) bool {
 	// (not Windows library code).
 	// TODO(mwhudson): needs to loop to support shared libs
 	if r.ip() < firstmoduledata.text || firstmoduledata.etext < r.ip() {
-		return false
-	}
-
-	// In the case of an abort, the exception IP is one byte after
-	// the INT3 (this differs from UNIX OSes).
-	if isAbortPC(r.ip() - 1) {
-		// Never turn abort into a panic.
 		return false
 	}
 
@@ -73,6 +82,7 @@ func isgoexception(info *exceptionrecord, r *context) bool {
 	case _EXCEPTION_FLT_OVERFLOW:
 	case _EXCEPTION_FLT_UNDERFLOW:
 	case _EXCEPTION_BREAKPOINT:
+	case _EXCEPTION_ILLEGAL_INSTRUCTION: // breakpoint arrives this way on arm64
 	}
 	return true
 }
@@ -91,21 +101,23 @@ func exceptionhandler(info *exceptionrecord, r *context, gp *g) int32 {
 		return _EXCEPTION_CONTINUE_SEARCH
 	}
 
-	// After this point, it is safe to grow the stack.
-
-	if gp.throwsplit {
-		// We can't safely sigpanic because it may grow the
-		// stack. Let it fall through.
-		return _EXCEPTION_CONTINUE_SEARCH
+	if gp.throwsplit || isAbort(r) {
+		// We can't safely sigpanic because it may grow the stack.
+		// Or this is a call to abort.
+		// Don't go through any more of the Windows handler chain.
+		// Crash now.
+		winthrow(info, r, gp)
 	}
+
+	// After this point, it is safe to grow the stack.
 
 	// Make it look like a call to the signal func.
 	// Have to pass arguments out of band since
 	// augmenting the stack frame would break
 	// the unwinding code.
 	gp.sig = info.exceptioncode
-	gp.sigcode0 = uintptr(info.exceptioninformation[0])
-	gp.sigcode1 = uintptr(info.exceptioninformation[1])
+	gp.sigcode0 = info.exceptioninformation[0]
+	gp.sigcode1 = info.exceptioninformation[1]
 	gp.sigpc = r.ip()
 
 	// Only push runtime·sigpanic if r.ip() != 0.
@@ -114,13 +126,26 @@ func exceptionhandler(info *exceptionrecord, r *context, gp *g) int32 {
 	// make the trace look like a call to runtime·sigpanic instead.
 	// (Otherwise the trace will end at runtime·sigpanic and we
 	// won't get to see who faulted.)
-	if r.ip() != 0 {
+	// Also don't push a sigpanic frame if the faulting PC
+	// is the entry of asyncPreempt. In this case, we suspended
+	// the thread right between the fault and the exception handler
+	// starting to run, and we have pushed an asyncPreempt call.
+	// The exception is not from asyncPreempt, so not to push a
+	// sigpanic call to make it look like that. Instead, just
+	// overwrite the PC. (See issue #35773)
+	if r.ip() != 0 && r.ip() != funcPC(asyncPreempt) {
 		sp := unsafe.Pointer(r.sp())
-		sp = add(sp, ^(unsafe.Sizeof(uintptr(0)) - 1)) // sp--
-		*((*uintptr)(sp)) = r.ip()
-		r.setsp(uintptr(sp))
+		delta := uintptr(sys.StackAlign)
+		sp = add(sp, -delta)
+		r.set_sp(uintptr(sp))
+		if usesLR {
+			*((*uintptr)(sp)) = r.lr()
+			r.set_lr(r.ip())
+		} else {
+			*((*uintptr)(sp)) = r.ip()
+		}
 	}
-	r.setip(funcPC(sigpanic))
+	r.set_ip(funcPC(sigpanic))
 	return _EXCEPTION_CONTINUE_EXECUTION
 }
 
@@ -148,10 +173,22 @@ var testingWER bool
 //
 //go:nosplit
 func lastcontinuehandler(info *exceptionrecord, r *context, gp *g) int32 {
+	if islibrary || isarchive {
+		// Go DLL/archive has been loaded in a non-go program.
+		// If the exception does not originate from go, the go runtime
+		// should not take responsibility of crashing the process.
+		return _EXCEPTION_CONTINUE_SEARCH
+	}
 	if testingWER {
 		return _EXCEPTION_CONTINUE_SEARCH
 	}
 
+	winthrow(info, r, gp)
+	return 0 // not reached
+}
+
+//go:nosplit
+func winthrow(info *exceptionrecord, r *context, gp *g) {
 	_g_ := getg()
 
 	if panicking != 0 { // traceback already printed
@@ -177,11 +214,8 @@ func lastcontinuehandler(info *exceptionrecord, r *context, gp *g) int32 {
 	}
 	print("\n")
 
-	// TODO(jordanrh1): This may be needed for 386/AMD64 as well.
-	if GOARCH == "arm" {
-		_g_.m.throwing = 1
-		_g_.m.caughtsig.set(gp)
-	}
+	_g_.m.throwing = 1
+	_g_.m.caughtsig.set(gp)
 
 	level, _, docrash := gotraceback()
 	if level > 0 {
@@ -195,7 +229,6 @@ func lastcontinuehandler(info *exceptionrecord, r *context, gp *g) int32 {
 	}
 
 	exit(2)
-	return 0 // not reached
 }
 
 func sigpanic() {
@@ -206,8 +239,11 @@ func sigpanic() {
 
 	switch g.sig {
 	case _EXCEPTION_ACCESS_VIOLATION:
-		if g.sigcode1 < 0x1000 || g.paniconfault {
+		if g.sigcode1 < 0x1000 {
 			panicmem()
+		}
+		if g.paniconfault {
+			panicmemAddr(g.sigcode1)
 		}
 		print("unexpected fault address ", hex(g.sigcode1), "\n")
 		throw("fault")

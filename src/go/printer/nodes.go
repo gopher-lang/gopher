@@ -319,8 +319,12 @@ func (p *printer) exprList(prev0 token.Pos, list []ast.Expr, depth int, mode exp
 	}
 }
 
-func (p *printer) parameters(fields *ast.FieldList) {
-	p.print(fields.Opening, token.LPAREN)
+func (p *printer) parameters(fields *ast.FieldList, isTypeParam bool) {
+	openTok, closeTok := token.LPAREN, token.RPAREN
+	if isTypeParam {
+		openTok, closeTok = token.LBRACK, token.RBRACK
+	}
+	p.print(fields.Opening, openTok)
 	if len(fields.List) > 0 {
 		prevLine := p.lineFor(fields.Opening)
 		ws := indent
@@ -328,13 +332,8 @@ func (p *printer) parameters(fields *ast.FieldList) {
 			// determine par begin and end line (may be different
 			// if there are multiple parameter names for this par
 			// or the type is on a separate line)
-			var parLineBeg int
-			if len(par.Names) > 0 {
-				parLineBeg = p.lineFor(par.Names[0].Pos())
-			} else {
-				parLineBeg = p.lineFor(par.Type.Pos())
-			}
-			var parLineEnd = p.lineFor(par.Type.End())
+			parLineBeg := p.lineFor(par.Pos())
+			parLineEnd := p.lineFor(par.End())
 			// separating "," if needed
 			needsLinebreak := 0 < prevLine && prevLine < parLineBeg
 			if i > 0 {
@@ -379,25 +378,29 @@ func (p *printer) parameters(fields *ast.FieldList) {
 			p.print(unindent)
 		}
 	}
-	p.print(fields.Closing, token.RPAREN)
+	p.print(fields.Closing, closeTok)
 }
 
-func (p *printer) signature(params, result *ast.FieldList) {
-	if params != nil {
-		p.parameters(params)
+func (p *printer) signature(sig *ast.FuncType) {
+	if sig.TParams != nil {
+		p.parameters(sig.TParams, true)
+	}
+	if sig.Params != nil {
+		p.parameters(sig.Params, false)
 	} else {
 		p.print(token.LPAREN, token.RPAREN)
 	}
-	n := result.NumFields()
+	res := sig.Results
+	n := res.NumFields()
 	if n > 0 {
-		// result != nil
+		// res != nil
 		p.print(blank)
-		if n == 1 && result.List[0].Names == nil {
-			// single anonymous result; no ()'s
-			p.expr(stripParensAlways(result.List[0].Type))
+		if n == 1 && res.List[0].Names == nil {
+			// single anonymous res; no ()'s
+			p.expr(stripParensAlways(res.List[0].Type))
 			return
 		}
-		p.parameters(result)
+		p.parameters(res, false)
 	}
 }
 
@@ -467,10 +470,18 @@ func (p *printer) fieldList(fields *ast.FieldList, isStruct, isIncomplete bool) 
 				}
 				p.expr(f.Type)
 			} else { // interface
-				if ftyp, isFtyp := f.Type.(*ast.FuncType); isFtyp {
-					// method
-					p.expr(f.Names[0])
-					p.signature(ftyp.Params, ftyp.Results)
+				if len(f.Names) > 0 {
+					// type list type or method
+					name := f.Names[0] // "type" or method name
+					p.expr(name)
+					if name.Name == "type" {
+						// type list type
+						p.print(blank)
+						p.expr(f.Type)
+					} else {
+						// method
+						p.signature(f.Type.(*ast.FuncType)) // don't print "func"
+					}
 				} else {
 					// embedded interface
 					p.expr(f.Type)
@@ -538,19 +549,47 @@ func (p *printer) fieldList(fields *ast.FieldList, isStruct, isIncomplete bool) 
 	} else { // interface
 
 		var line int
+		var prev *ast.Ident // previous "type" identifier
 		for i, f := range list {
+			var name *ast.Ident // first name, or nil
+			if len(f.Names) > 0 {
+				name = f.Names[0]
+			}
 			if i > 0 {
-				p.linebreak(p.lineFor(f.Pos()), 1, ignore, p.linesFrom(line) > 0)
+				// don't do a line break (min == 0) if we are printing a list of types
+				// TODO(gri) this doesn't work quite right if the list of types is
+				//           spread across multiple lines
+				min := 1
+				if prev != nil && name == prev {
+					min = 0
+				}
+				p.linebreak(p.lineFor(f.Pos()), min, ignore, p.linesFrom(line) > 0)
 			}
 			p.setComment(f.Doc)
 			p.recordLine(&line)
-			if ftyp, isFtyp := f.Type.(*ast.FuncType); isFtyp {
-				// method
-				p.expr(f.Names[0])
-				p.signature(ftyp.Params, ftyp.Results)
+			if name != nil {
+				// type list type or method
+				if name.Name == "type" {
+					// type list type
+					if name == prev {
+						// type is part of a list of types
+						p.print(token.COMMA, blank)
+					} else {
+						// type starts a new list of types
+						p.print(name, blank)
+					}
+					p.expr(f.Type)
+					prev = name
+				} else {
+					// method
+					p.expr(name)
+					p.signature(f.Type.(*ast.FuncType)) // don't print "func"
+					prev = nil
+				}
 			} else {
 				// embedded interface
 				p.expr(f.Type)
+				prev = nil
 			}
 			p.setComment(f.Comment)
 		}
@@ -791,11 +830,17 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		}
 
 	case *ast.BasicLit:
+		if p.Config.Mode&normalizeNumbers != 0 {
+			x = normalizedNumber(x)
+		}
 		p.print(x)
 
 	case *ast.FuncLit:
-		p.expr(x.Type)
-		p.funcBody(p.distanceFrom(x.Type.Pos()), blank, x.Body)
+		p.print(x.Type.Pos(), token.FUNC)
+		// See the comment in funcDecl about how the header size is computed.
+		startCol := p.out.Column - len("func")
+		p.signature(x.Type)
+		p.funcBody(p.distanceFrom(x.Type.Pos(), startCol), blank, x.Body)
 
 	case *ast.ParenExpr:
 		if _, hasParens := x.X.(*ast.ParenExpr); hasParens {
@@ -825,7 +870,11 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		// TODO(gri): should treat[] like parentheses and undo one level of depth
 		p.expr1(x.X, token.HighestPrec, 1)
 		p.print(x.Lbrack, token.LBRACK)
-		p.expr0(x.Index, depth+1)
+		if e, _ := x.Index.(*ast.ListExpr); e != nil {
+			p.exprList(x.Lbrack, e.ElemList, depth+1, commaTerm, x.Rbrack, false)
+		} else {
+			p.expr0(x.Index, depth+1)
+		}
 		p.print(x.Rbrack, token.RBRACK)
 
 	case *ast.SliceExpr:
@@ -939,7 +988,7 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 
 	case *ast.FuncType:
 		p.print(token.FUNC)
-		p.signature(x.Params, x.Results)
+		p.signature(x)
 
 	case *ast.InterfaceType:
 		p.print(token.INTERFACE)
@@ -968,6 +1017,66 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 	}
 }
 
+// normalizedNumber rewrites base prefixes and exponents
+// of numbers to use lower-case letters (0X123 to 0x123 and 1.2E3 to 1.2e3),
+// and removes leading 0's from integer imaginary literals (0765i to 765i).
+// It leaves hexadecimal digits alone.
+//
+// normalizedNumber doesn't modify the ast.BasicLit value lit points to.
+// If lit is not a number or a number in canonical format already,
+// lit is returned as is. Otherwise a new ast.BasicLit is created.
+func normalizedNumber(lit *ast.BasicLit) *ast.BasicLit {
+	if lit.Kind != token.INT && lit.Kind != token.FLOAT && lit.Kind != token.IMAG {
+		return lit // not a number - nothing to do
+	}
+	if len(lit.Value) < 2 {
+		return lit // only one digit (common case) - nothing to do
+	}
+	// len(lit.Value) >= 2
+
+	// We ignore lit.Kind because for lit.Kind == token.IMAG the literal may be an integer
+	// or floating-point value, decimal or not. Instead, just consider the literal pattern.
+	x := lit.Value
+	switch x[:2] {
+	default:
+		// 0-prefix octal, decimal int, or float (possibly with 'i' suffix)
+		if i := strings.LastIndexByte(x, 'E'); i >= 0 {
+			x = x[:i] + "e" + x[i+1:]
+			break
+		}
+		// remove leading 0's from integer (but not floating-point) imaginary literals
+		if x[len(x)-1] == 'i' && strings.IndexByte(x, '.') < 0 && strings.IndexByte(x, 'e') < 0 {
+			x = strings.TrimLeft(x, "0_")
+			if x == "i" {
+				x = "0i"
+			}
+		}
+	case "0X":
+		x = "0x" + x[2:]
+		// possibly a hexadecimal float
+		if i := strings.LastIndexByte(x, 'P'); i >= 0 {
+			x = x[:i] + "p" + x[i+1:]
+		}
+	case "0x":
+		// possibly a hexadecimal float
+		i := strings.LastIndexByte(x, 'P')
+		if i == -1 {
+			return lit // nothing to do
+		}
+		x = x[:i] + "p" + x[i+1:]
+	case "0O":
+		x = "0o" + x[2:]
+	case "0o":
+		return lit // nothing to do
+	case "0B":
+		x = "0b" + x[2:]
+	case "0b":
+		return lit // nothing to do
+	}
+
+	return &ast.BasicLit{ValuePos: lit.ValuePos, Kind: lit.Kind, Value: x}
+}
+
 func (p *printer) possibleSelectorExpr(expr ast.Expr, prec1, depth int) bool {
 	if x, ok := expr.(*ast.SelectorExpr); ok {
 		return p.selectorExpr(x, depth, true)
@@ -976,7 +1085,7 @@ func (p *printer) possibleSelectorExpr(expr ast.Expr, prec1, depth int) bool {
 	return false
 }
 
-// selectorExpr handles an *ast.SelectorExpr node and returns whether x spans
+// selectorExpr handles an *ast.SelectorExpr node and reports whether x spans
 // multiple lines.
 func (p *printer) selectorExpr(x *ast.SelectorExpr, depth int, isMethod bool) bool {
 	p.expr1(x.X, token.HighestPrec, depth)
@@ -1134,7 +1243,7 @@ func (p *printer) controlClause(isForStmt bool, init ast.Stmt, expr ast.Expr, po
 // than starting at the first line break).
 //
 func (p *printer) indentList(list []ast.Expr) bool {
-	// Heuristic: indentList returns true if there are more than one multi-
+	// Heuristic: indentList reports whether there are more than one multi-
 	// line element in the list, or if there is any element that is not
 	// starting on the same line as the previous one ends.
 	if len(list) >= 2 {
@@ -1237,10 +1346,12 @@ func (p *printer) stmt(stmt ast.Stmt, nextIsRBrace bool) {
 			// lead to more nicely formatted code in general.
 			if p.indentList(s.Results) {
 				p.print(indent)
-				p.exprList(s.Pos(), s.Results, 1, noIndent, token.NoPos, false)
+				// Use NoPos so that a newline never goes before
+				// the results (see issue #32854).
+				p.exprList(token.NoPos, s.Results, 1, noIndent, token.NoPos, false)
 				p.print(unindent)
 			} else {
-				p.exprList(s.Pos(), s.Results, 1, 0, token.NoPos, false)
+				p.exprList(token.NoPos, s.Results, 1, 0, token.NoPos, false)
 			}
 		}
 
@@ -1517,6 +1628,9 @@ func (p *printer) spec(spec ast.Spec, n int, doIndent bool) {
 	case *ast.TypeSpec:
 		p.setComment(s.Doc)
 		p.expr(s.Name)
+		if s.TParams != nil {
+			p.parameters(s.TParams, true)
+		}
 		if n == 1 {
 			p.print(blank)
 		} else {
@@ -1537,7 +1651,7 @@ func (p *printer) genDecl(d *ast.GenDecl) {
 	p.setComment(d.Doc)
 	p.print(d.Pos(), d.Tok, blank)
 
-	if d.Lparen.IsValid() {
+	if d.Lparen.IsValid() || len(d.Specs) > 1 {
 		// group of parenthesized declarations
 		p.print(d.Lparen, token.LPAREN)
 		if n := len(d.Specs); n > 0 {
@@ -1568,7 +1682,7 @@ func (p *printer) genDecl(d *ast.GenDecl) {
 		}
 		p.print(d.Rparen, token.RPAREN)
 
-	} else {
+	} else if len(d.Specs) > 0 {
 		// single declaration
 		p.spec(d.Specs[0], 1, true)
 	}
@@ -1687,14 +1801,12 @@ func (p *printer) funcBody(headerSize int, sep whiteSpace, b *ast.BlockStmt) {
 	p.block(b, 1)
 }
 
-// distanceFrom returns the column difference between from and p.pos (the current
-// estimated position) if both are on the same line; if they are on different lines
-// (or unknown) the result is infinity.
-func (p *printer) distanceFrom(from token.Pos) int {
-	if from.IsValid() && p.pos.IsValid() {
-		if f := p.posFor(from); f.Line == p.pos.Line {
-			return p.pos.Column - f.Column
-		}
+// distanceFrom returns the column difference between p.out (the current output
+// position) and startOutCol. If the start position is on a different line from
+// the current position (or either is unknown), the result is infinity.
+func (p *printer) distanceFrom(startPos token.Pos, startOutCol int) int {
+	if startPos.IsValid() && p.pos.IsValid() && p.posFor(startPos).Line == p.pos.Line {
+		return p.out.Column - startOutCol
 	}
 	return infinity
 }
@@ -1702,13 +1814,17 @@ func (p *printer) distanceFrom(from token.Pos) int {
 func (p *printer) funcDecl(d *ast.FuncDecl) {
 	p.setComment(d.Doc)
 	p.print(d.Pos(), token.FUNC, blank)
+	// We have to save startCol only after emitting FUNC; otherwise it can be on a
+	// different line (all whitespace preceding the FUNC is emitted only when the
+	// FUNC is emitted).
+	startCol := p.out.Column - len("func ")
 	if d.Recv != nil {
-		p.parameters(d.Recv) // method: print receiver
+		p.parameters(d.Recv, false) // method: print receiver
 		p.print(blank)
 	}
 	p.expr(d.Name)
-	p.signature(d.Type.Params, d.Type.Results)
-	p.funcBody(p.distanceFrom(d.Pos()), vtab, d.Body)
+	p.signature(d.Type)
+	p.funcBody(p.distanceFrom(d.Pos(), startCol), vtab, d.Body)
 }
 
 func (p *printer) decl(decl ast.Decl) {

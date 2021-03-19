@@ -15,6 +15,7 @@ import (
 	"go/token"
 	"go/types"
 	"io"
+	"math/big"
 	"sort"
 )
 
@@ -61,8 +62,8 @@ const (
 // If the export data version is not recognized or the format is otherwise
 // compromised, an error is returned.
 func iImportData(fset *token.FileSet, imports map[string]*types.Package, data []byte, path string) (_ int, pkg *types.Package, err error) {
-	const currentVersion = 0
-	version := -1
+	const currentVersion = 1
+	version := int64(-1)
 	defer func() {
 		if e := recover(); e != nil {
 			if version > currentVersion {
@@ -75,9 +76,9 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, data []
 
 	r := &intReader{bytes.NewReader(data), path}
 
-	version = int(r.uint64())
+	version = int64(r.uint64())
 	switch version {
-	case currentVersion:
+	case currentVersion, 0:
 	default:
 		errorf("unknown iexport format version %d", version)
 	}
@@ -91,7 +92,8 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, data []
 	r.Seek(sLen+dLen, io.SeekCurrent)
 
 	p := iimporter{
-		ipath: path,
+		ipath:   path,
+		version: int(version),
 
 		stringData:  stringData,
 		stringCache: make(map[uint64]string),
@@ -169,7 +171,8 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, data []
 }
 
 type iimporter struct {
-	ipath string
+	ipath   string
+	version int
 
 	stringData  []byte
 	stringCache map[uint64]string
@@ -249,6 +252,7 @@ type importReader struct {
 	currPkg    *types.Package
 	prevFile   string
 	prevLine   int64
+	prevColumn int64
 }
 
 func (r *importReader) obj(name string) {
@@ -317,7 +321,9 @@ func (r *importReader) value() (typ types.Type, val constant.Value) {
 		val = constant.MakeString(r.string())
 
 	case types.IsInteger:
-		val = r.mpint(b)
+		var x big.Int
+		r.mpint(&x, b)
+		val = constant.Make(&x)
 
 	case types.IsFloat:
 		val = r.mpfloat(b)
@@ -362,8 +368,8 @@ func intSize(b *types.Basic) (signed bool, maxBytes uint) {
 	return
 }
 
-func (r *importReader) mpint(b *types.Basic) constant.Value {
-	signed, maxBytes := intSize(b)
+func (r *importReader) mpint(x *big.Int, typ *types.Basic) {
+	signed, maxBytes := intSize(typ)
 
 	maxSmall := 256 - maxBytes
 	if signed {
@@ -382,7 +388,8 @@ func (r *importReader) mpint(b *types.Basic) constant.Value {
 				v = ^v
 			}
 		}
-		return constant.MakeInt64(v)
+		x.SetInt64(v)
+		return
 	}
 
 	v := -n
@@ -392,39 +399,23 @@ func (r *importReader) mpint(b *types.Basic) constant.Value {
 	if v < 1 || uint(v) > maxBytes {
 		errorf("weird decoding: %v, %v => %v", n, signed, v)
 	}
-
-	buf := make([]byte, v)
-	io.ReadFull(&r.declReader, buf)
-
-	// convert to little endian
-	// TODO(gri) go/constant should have a more direct conversion function
-	//           (e.g., once it supports a big.Float based implementation)
-	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
-		buf[i], buf[j] = buf[j], buf[i]
-	}
-
-	x := constant.MakeFromBytes(buf)
+	b := make([]byte, v)
+	io.ReadFull(&r.declReader, b)
+	x.SetBytes(b)
 	if signed && n&1 != 0 {
-		x = constant.UnaryOp(token.SUB, x, 0)
+		x.Neg(x)
 	}
-	return x
 }
 
-func (r *importReader) mpfloat(b *types.Basic) constant.Value {
-	x := r.mpint(b)
-	if constant.Sign(x) == 0 {
-		return x
+func (r *importReader) mpfloat(typ *types.Basic) constant.Value {
+	var mant big.Int
+	r.mpint(&mant, typ)
+	var f big.Float
+	f.SetInt(&mant)
+	if f.Sign() != 0 {
+		f.SetMantExp(&f, int(r.int64()))
 	}
-
-	exp := r.int64()
-	switch {
-	case exp > 0:
-		x = constant.Shift(x, token.SHL, uint(exp))
-	case exp < 0:
-		d := constant.Shift(constant.MakeInt64(1), token.SHL, uint(-exp))
-		x = constant.BinaryOp(x, token.QUO, d)
-	}
-	return x
+	return constant.Make(&f)
 }
 
 func (r *importReader) ident() string {
@@ -438,6 +429,19 @@ func (r *importReader) qualifiedIdent() (*types.Package, string) {
 }
 
 func (r *importReader) pos() token.Pos {
+	if r.p.version >= 1 {
+		r.posv1()
+	} else {
+		r.posv0()
+	}
+
+	if r.prevFile == "" && r.prevLine == 0 && r.prevColumn == 0 {
+		return token.NoPos
+	}
+	return r.p.fake.pos(r.prevFile, int(r.prevLine), int(r.prevColumn))
+}
+
+func (r *importReader) posv0() {
 	delta := r.int64()
 	if delta != deltaNewFile {
 		r.prevLine += delta
@@ -447,12 +451,18 @@ func (r *importReader) pos() token.Pos {
 		r.prevFile = r.string()
 		r.prevLine = l
 	}
+}
 
-	if r.prevFile == "" && r.prevLine == 0 {
-		return token.NoPos
+func (r *importReader) posv1() {
+	delta := r.int64()
+	r.prevColumn += delta >> 1
+	if delta&1 != 0 {
+		delta = r.int64()
+		r.prevLine += delta >> 1
+		if delta&1 != 0 {
+			r.prevFile = r.string()
+		}
 	}
-
-	return r.p.fake.pos(r.prevFile, int(r.prevLine))
 }
 
 func (r *importReader) typ() types.Type {

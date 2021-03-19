@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 // mkpost processes the output of cgo -godefs to
@@ -14,7 +15,7 @@ package main
 import (
 	"fmt"
 	"go/format"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"regexp"
@@ -22,7 +23,7 @@ import (
 )
 
 func main() {
-	b, err := ioutil.ReadAll(os.Stdin)
+	b, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -30,7 +31,8 @@ func main() {
 
 	goarch := os.Getenv("GOARCH")
 	goos := os.Getenv("GOOS")
-	if goarch == "s390x" && goos == "linux" {
+	switch {
+	case goarch == "s390x" && goos == "linux":
 		// Export the types of PtraceRegs fields.
 		re := regexp.MustCompile("ptrace(Psw|Fpregs|Per)")
 		s = re.ReplaceAllString(s, "Ptrace$1")
@@ -53,6 +55,11 @@ func main() {
 		// the existing gccgo API.
 		re = regexp.MustCompile("(Data\\s+\\[14\\])uint8")
 		s = re.ReplaceAllString(s, "${1}int8")
+
+	case goos == "freebsd":
+		// Keep pre-FreeBSD 10 / non-POSIX 2008 names for timespec fields
+		re := regexp.MustCompile("(A|M|C|Birth)tim\\s+Timespec")
+		s = re.ReplaceAllString(s, "${1}timespec Timespec")
 	}
 
 	// gofmt

@@ -8,6 +8,7 @@
 #include "go_tls.h"
 #include "funcdata.h"
 #include "textflag.h"
+#include "asm_ppc64x.h"
 
 // The following functions allow calling the clang-compiled race runtime directly
 // from Go code without going all the way through cgo.
@@ -97,11 +98,11 @@ TEXT	runtime·racereadrangepc1(SB), NOSPLIT, $0-24
 	MOVD    size+8(FP), R5
 	MOVD    pc+16(FP), R6
 	ADD	$4, R6		// tsan wants return addr
-        // void __tsan_read_range(ThreadState *thr, void *addr, uintptr size, void *pc);
-        MOVD    $__tsan_read_range(SB), R8
-        BR	racecalladdr<>(SB)
+	// void __tsan_read_range(ThreadState *thr, void *addr, uintptr size, void *pc);
+	MOVD    $__tsan_read_range(SB), R8
+	BR	racecalladdr<>(SB)
 
-TEXT    runtime·RaceReadRange(SB), NOSPLIT, $0-24
+TEXT    runtime·RaceReadRange(SB), NOSPLIT, $0-16
 	BR	runtime·racereadrange(SB)
 
 // func runtime·RaceWriteRange(addr, size uintptr)
@@ -162,23 +163,13 @@ call:
 ret:
 	RET
 
-// func runtime·racefuncenterfp()
-// Called from instrumented Go code.
-// Like racefuncenter but doesn't pass an arg, uses the caller pc
-// from the first slot on the stack.
-TEXT	runtime·racefuncenterfp(SB), NOSPLIT, $0-0
-	MOVD	0(R1), R8
-	BR	racefuncenter<>(SB)
-
 // func runtime·racefuncenter(pc uintptr)
 // Called from instrumented Go code.
-// Not used now since gc/racewalk.go doesn't pass the
-// correct caller pc and racefuncenterfp can do it.
 TEXT	runtime·racefuncenter(SB), NOSPLIT, $0-8
 	MOVD	callpc+0(FP), R8
 	BR	racefuncenter<>(SB)
 
-// Common code for racefuncenter/racefuncenterfp
+// Common code for racefuncenter
 // R11 = caller's return address
 TEXT	racefuncenter<>(SB), NOSPLIT, $0-0
 	MOVD    runtime·tls_g(SB), R10
@@ -206,78 +197,95 @@ TEXT	runtime·racefuncexit(SB), NOSPLIT, $0-0
 // R3, R4, R5 set in racecallatomic
 
 // Load atomic in tsan
-TEXT	sync∕atomic·LoadInt32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·LoadInt32(SB), NOSPLIT, $0-12
+	GO_ARGS
 	// void __tsan_go_atomic32_load(ThreadState *thr, uptr cpc, uptr pc, u8 *a);
 	MOVD	$__tsan_go_atomic32_load(SB), R8
 	ADD	$32, R1, R6	// addr of caller's 1st arg
 	BR	racecallatomic<>(SB)
 	RET
 
-TEXT	sync∕atomic·LoadInt64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·LoadInt64(SB), NOSPLIT, $0-16
+	GO_ARGS
 	// void __tsan_go_atomic64_load(ThreadState *thr, uptr cpc, uptr pc, u8 *a);
 	MOVD	$__tsan_go_atomic64_load(SB), R8
 	ADD	$32, R1, R6	// addr of caller's 1st arg
 	BR	racecallatomic<>(SB)
 	RET
 
-TEXT	sync∕atomic·LoadUint32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·LoadUint32(SB), NOSPLIT, $0-12
+	GO_ARGS
 	BR	sync∕atomic·LoadInt32(SB)
 
-TEXT	sync∕atomic·LoadUint64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·LoadUint64(SB), NOSPLIT, $0-16
+	GO_ARGS
 	BR	sync∕atomic·LoadInt64(SB)
 
-TEXT	sync∕atomic·LoadUintptr(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·LoadUintptr(SB), NOSPLIT, $0-16
+	GO_ARGS
 	BR	sync∕atomic·LoadInt64(SB)
 
-TEXT	sync∕atomic·LoadPointer(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·LoadPointer(SB), NOSPLIT, $0-16
+	GO_ARGS
 	BR	sync∕atomic·LoadInt64(SB)
 
 // Store atomic in tsan
-TEXT	sync∕atomic·StoreInt32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·StoreInt32(SB), NOSPLIT, $0-12
+	GO_ARGS
 	// void __tsan_go_atomic32_store(ThreadState *thr, uptr cpc, uptr pc, u8 *a);
 	MOVD	$__tsan_go_atomic32_store(SB), R8
 	ADD	$32, R1, R6	// addr of caller's 1st arg
 	BR	racecallatomic<>(SB)
 
-TEXT	sync∕atomic·StoreInt64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·StoreInt64(SB), NOSPLIT, $0-16
+	GO_ARGS
 	// void __tsan_go_atomic64_store(ThreadState *thr, uptr cpc, uptr pc, u8 *a);
 	MOVD	$__tsan_go_atomic64_store(SB), R8
 	ADD	$32, R1, R6	// addr of caller's 1st arg
 	BR	racecallatomic<>(SB)
 
-TEXT	sync∕atomic·StoreUint32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·StoreUint32(SB), NOSPLIT, $0-12
+	GO_ARGS
 	BR	sync∕atomic·StoreInt32(SB)
 
-TEXT	sync∕atomic·StoreUint64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·StoreUint64(SB), NOSPLIT, $0-16
+	GO_ARGS
 	BR	sync∕atomic·StoreInt64(SB)
 
-TEXT	sync∕atomic·StoreUintptr(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·StoreUintptr(SB), NOSPLIT, $0-16
+	GO_ARGS
 	BR	sync∕atomic·StoreInt64(SB)
 
 // Swap in tsan
-TEXT	sync∕atomic·SwapInt32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·SwapInt32(SB), NOSPLIT, $0-20
+	GO_ARGS
 	// void __tsan_go_atomic32_exchange(ThreadState *thr, uptr cpc, uptr pc, u8 *a);
 	MOVD	$__tsan_go_atomic32_exchange(SB), R8
 	ADD	$32, R1, R6	// addr of caller's 1st arg
 	BR	racecallatomic<>(SB)
 
-TEXT	sync∕atomic·SwapInt64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·SwapInt64(SB), NOSPLIT, $0-24
+	GO_ARGS
 	// void __tsan_go_atomic64_exchange(ThreadState *thr, uptr cpc, uptr pc, u8 *a)
 	MOVD	$__tsan_go_atomic64_exchange(SB), R8
 	ADD	$32, R1, R6	// addr of caller's 1st arg
 	BR	racecallatomic<>(SB)
 
-TEXT	sync∕atomic·SwapUint32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·SwapUint32(SB), NOSPLIT, $0-20
+	GO_ARGS
 	BR	sync∕atomic·SwapInt32(SB)
 
-TEXT	sync∕atomic·SwapUint64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·SwapUint64(SB), NOSPLIT, $0-24
+	GO_ARGS
 	BR	sync∕atomic·SwapInt64(SB)
 
-TEXT	sync∕atomic·SwapUintptr(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·SwapUintptr(SB), NOSPLIT, $0-24
+	GO_ARGS
 	BR	sync∕atomic·SwapInt64(SB)
 
 // Add atomic in tsan
-TEXT	sync∕atomic·AddInt32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·AddInt32(SB), NOSPLIT, $0-20
+	GO_ARGS
 	// void __tsan_go_atomic32_fetch_add(ThreadState *thr, uptr cpc, uptr pc, u8 *a);
 	MOVD	$__tsan_go_atomic32_fetch_add(SB), R8
 	ADD	$64, R1, R6	// addr of caller's 1st arg
@@ -290,7 +298,8 @@ TEXT	sync∕atomic·AddInt32(SB), NOSPLIT, $0-0
 	MOVW	R3, ret+16(FP)
 	RET
 
-TEXT	sync∕atomic·AddInt64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·AddInt64(SB), NOSPLIT, $0-24
+	GO_ARGS
 	// void __tsan_go_atomic64_fetch_add(ThreadState *thr, uptr cpc, uptr pc, u8 *a);
 	MOVD	$__tsan_go_atomic64_fetch_add(SB), R8
 	ADD	$64, R1, R6	// addr of caller's 1st arg
@@ -303,37 +312,45 @@ TEXT	sync∕atomic·AddInt64(SB), NOSPLIT, $0-0
 	MOVD	R3, ret+16(FP)
 	RET
 
-TEXT	sync∕atomic·AddUint32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·AddUint32(SB), NOSPLIT, $0-20
+	GO_ARGS
 	BR	sync∕atomic·AddInt32(SB)
 
-TEXT	sync∕atomic·AddUint64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·AddUint64(SB), NOSPLIT, $0-24
+	GO_ARGS
 	BR	sync∕atomic·AddInt64(SB)
 
-TEXT	sync∕atomic·AddUintptr(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·AddUintptr(SB), NOSPLIT, $0-24
+	GO_ARGS
 	BR	sync∕atomic·AddInt64(SB)
 
 // CompareAndSwap in tsan
-TEXT	sync∕atomic·CompareAndSwapInt32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·CompareAndSwapInt32(SB), NOSPLIT, $0-17
+	GO_ARGS
 	// void __tsan_go_atomic32_compare_exchange(
 	//   ThreadState *thr, uptr cpc, uptr pc, u8 *a)
 	MOVD	$__tsan_go_atomic32_compare_exchange(SB), R8
 	ADD	$32, R1, R6	// addr of caller's 1st arg
 	BR	racecallatomic<>(SB)
 
-TEXT	sync∕atomic·CompareAndSwapInt64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·CompareAndSwapInt64(SB), NOSPLIT, $0-25
+	GO_ARGS
 	// void __tsan_go_atomic32_compare_exchange(
 	//   ThreadState *thr, uptr cpc, uptr pc, u8 *a)
 	MOVD	$__tsan_go_atomic64_compare_exchange(SB), R8
 	ADD	$32, R1, R6	// addr of caller's 1st arg
 	BR	racecallatomic<>(SB)
 
-TEXT	sync∕atomic·CompareAndSwapUint32(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·CompareAndSwapUint32(SB), NOSPLIT, $0-17
+	GO_ARGS
 	BR	sync∕atomic·CompareAndSwapInt32(SB)
 
-TEXT	sync∕atomic·CompareAndSwapUint64(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·CompareAndSwapUint64(SB), NOSPLIT, $0-25
+	GO_ARGS
 	BR	sync∕atomic·CompareAndSwapInt64(SB)
 
-TEXT	sync∕atomic·CompareAndSwapUintptr(SB), NOSPLIT, $0-0
+TEXT	sync∕atomic·CompareAndSwapUintptr(SB), NOSPLIT, $0-25
+	GO_ARGS
 	BR	sync∕atomic·CompareAndSwapInt64(SB)
 
 // Common function used to call tsan's atomic functions
@@ -384,8 +401,8 @@ racecallatomic_ignore:
 	MOVD	R17, R6 // restore arg list addr
 	// Call the atomic function.
 	// racecall will call LLVM race code which might clobber r30 (g)
-	MOVD    runtime·tls_g(SB), R10
-        MOVD    0(R13)(R10*1), g
+	MOVD	runtime·tls_g(SB), R10
+	MOVD	0(R13)(R10*1), g
 
 	MOVD	g_racectx(g), R3
 	MOVD	R8, R4		// pc being called same TODO as above
@@ -455,7 +472,7 @@ TEXT	runtime·racecallbackthunk(SB), NOSPLIT, $-8
 	MOVD    0(R13)(R10*1), g
 	MOVD	g_m(g), R3
 	MOVD	m_p(R3), R3
-	MOVD	p_racectx(R3), R3
+	MOVD	p_raceprocctx(R3), R3
 	MOVD	R3, (R4)
 	MOVD	R9, g		// restore R30 ??
 	RET
@@ -467,9 +484,9 @@ rest:
 	MOVD	R10, 16(R1)
 	MOVW	CR, R10
 	MOVW	R10, 8(R1)
-	MOVDU   R1, -336(R1) // Allocate frame needed for register save area
+	MOVDU   R1, -336(R1) // Allocate frame needed for outargs and register save area
 
-	MOVD    R14, 40(R1)
+	MOVD    R14, 328(R1)
 	MOVD    R15, 48(R1)
 	MOVD    R16, 56(R1)
 	MOVD    R17, 64(R1)
@@ -506,21 +523,30 @@ rest:
 	FMOVD   F30, 312(R1)
 	FMOVD   F31, 320(R1)
 
+	MOVD	R3, FIXED_FRAME+0(R1)
+	MOVD	R4, FIXED_FRAME+8(R1)
+
 	MOVD    runtime·tls_g(SB), R10
 	MOVD    0(R13)(R10*1), g
 
 	MOVD	g_m(g), R7
-	MOVD	m_g0(R7), g // set g = m-> g0
-	MOVD	R3, cmd+0(FP) // can't use R1 here ?? use input args and assumer caller expects those?
-	MOVD	R4, ctx+8(FP) // can't use R1 here ??
+	MOVD	m_g0(R7), R8
+	CMP	g, R8
+	BEQ	noswitch
+
+	MOVD	R8, g // set g = m-> g0
+
 	BL	runtime·racecallback(SB)
+
 	// All registers are clobbered after Go code, reload.
 	MOVD    runtime·tls_g(SB), R10
-        MOVD    0(R13)(R10*1), g
+	MOVD    0(R13)(R10*1), g
 
 	MOVD	g_m(g), R7
 	MOVD	m_curg(R7), g // restore g = m->curg
-	MOVD    40(R1), R14
+
+ret:
+	MOVD    328(R1), R14
 	MOVD    48(R1), R15
 	MOVD    56(R1), R16
 	MOVD    64(R1), R17
@@ -563,6 +589,10 @@ rest:
 	MOVD    16(R1), R10	// needed?
 	MOVD    R10, LR
 	RET
+
+noswitch:
+	BL      runtime·racecallback(SB)
+	JMP     ret
 
 // tls_g, g value for each thread in TLS
 GLOBL runtime·tls_g+0(SB), TLSBSS+DUPOK, $8

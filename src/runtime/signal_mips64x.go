@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build linux
+//go:build (linux || openbsd) && (mips64 || mips64le)
+// +build linux openbsd
 // +build mips64 mips64le
 
 package runtime
@@ -83,4 +84,18 @@ func (c *sigctxt) preparePanic(sig uint32, gp *g) {
 	c.set_r28(sigpanicPC >> 32 << 32) // RSB register
 	c.set_r30(uint64(uintptr(unsafe.Pointer(gp))))
 	c.set_pc(sigpanicPC)
+}
+
+func (c *sigctxt) pushCall(targetPC, resumePC uintptr) {
+	// Push the LR to stack, as we'll clobber it in order to
+	// push the call. The function being pushed is responsible
+	// for restoring the LR and setting the SP back.
+	// This extra slot is known to gentraceback.
+	sp := c.sp() - 8
+	c.set_sp(sp)
+	*(*uint64)(unsafe.Pointer(uintptr(sp))) = c.link()
+	// Set up PC and LR to pretend the function being signaled
+	// calls targetPC at resumePC.
+	c.set_link(uint64(resumePC))
+	c.set_pc(uint64(targetPC))
 }

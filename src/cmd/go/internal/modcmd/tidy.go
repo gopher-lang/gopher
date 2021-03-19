@@ -7,18 +7,15 @@
 package modcmd
 
 import (
-	"fmt"
-	"os"
-
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
-	"cmd/go/internal/modfetch"
+	"cmd/go/internal/imports"
 	"cmd/go/internal/modload"
-	"cmd/go/internal/module"
+	"context"
 )
 
 var cmdTidy = &base.Command{
-	UsageLine: "go mod tidy [-v]",
+	UsageLine: "go mod tidy [-e] [-v]",
 	Short:     "add missing and remove unused modules",
 	Long: `
 Tidy makes sure go.mod matches the source code in the module.
@@ -29,62 +26,54 @@ to go.sum and removes any unnecessary ones.
 
 The -v flag causes tidy to print information about removed modules
 to standard error.
+
+The -e flag causes tidy to attempt to proceed despite errors
+encountered while loading packages.
+
+See https://golang.org/ref/mod#go-mod-tidy for more about 'go mod tidy'.
 	`,
+	Run: runTidy,
 }
+
+var tidyE bool // if true, report errors but proceed anyway.
 
 func init() {
-	cmdTidy.Run = runTidy // break init cycle
 	cmdTidy.Flag.BoolVar(&cfg.BuildV, "v", false, "")
+	cmdTidy.Flag.BoolVar(&tidyE, "e", false, "")
+	base.AddModCommonFlags(&cmdTidy.Flag)
 }
 
-func runTidy(cmd *base.Command, args []string) {
+func runTidy(ctx context.Context, cmd *base.Command, args []string) {
 	if len(args) > 0 {
 		base.Fatalf("go mod tidy: no arguments allowed")
 	}
 
-	// LoadALL adds missing modules.
-	// Remove unused modules.
-	used := make(map[module.Version]bool)
-	for _, pkg := range modload.LoadALL() {
-		used[modload.PackageModule(pkg)] = true
-	}
-	used[modload.Target] = true // note: LoadALL initializes Target
+	// Tidy aims to make 'go test' reproducible for any package in 'all', so we
+	// need to include test dependencies. For modules that specify go 1.15 or
+	// earlier this is a no-op (because 'all' saturates transitive test
+	// dependencies).
+	//
+	// However, with lazy loading (go 1.16+) 'all' includes only the packages that
+	// are transitively imported by the main module, not the test dependencies of
+	// those packages. In order to make 'go test' reproducible for the packages
+	// that are in 'all' but outside of the main module, we must explicitly
+	// request that their test dependencies be included.
+	modload.ForceUseModules = true
+	modload.RootMode = modload.NeedRoot
+	modload.DisallowWriteGoMod() // Suppress writing until we've tidied the file.
 
-	inGoMod := make(map[string]bool)
-	for _, r := range modload.ModFile().Require {
-		inGoMod[r.Mod.Path] = true
-	}
+	modload.LoadPackages(ctx, modload.PackageOpts{
+		Tags:                     imports.AnyTags(),
+		VendorModulesInGOROOTSrc: true,
+		ResolveMissingImports:    true,
+		LoadTests:                true,
+		AllowErrors:              tidyE,
+		SilenceMissingStdImports: true,
+	}, "all")
 
-	var keep []module.Version
-	for _, m := range modload.BuildList() {
-		if used[m] {
-			keep = append(keep, m)
-		} else if cfg.BuildV && inGoMod[m.Path] {
-			fmt.Fprintf(os.Stderr, "unused %s\n", m.Path)
-		}
-	}
-	modload.SetBuildList(keep)
-	modTidyGoSum() // updates memory copy; WriteGoMod on next line flushes it out
+	modload.TidyBuildList()
+	modload.TrimGoSum()
+
+	modload.AllowWriteGoMod()
 	modload.WriteGoMod()
-}
-
-// modTidyGoSum resets the go.sum file content
-// to be exactly what's needed for the current go.mod.
-func modTidyGoSum() {
-	// Assuming go.sum already has at least enough from the successful load,
-	// we only have to tell modfetch what needs keeping.
-	reqs := modload.Reqs()
-	keep := make(map[module.Version]bool)
-	var walk func(module.Version)
-	walk = func(m module.Version) {
-		keep[m] = true
-		list, _ := reqs.Required(m)
-		for _, r := range list {
-			if !keep[r] {
-				walk(r)
-			}
-		}
-	}
-	walk(modload.Target)
-	modfetch.TrimGoSum(keep)
 }

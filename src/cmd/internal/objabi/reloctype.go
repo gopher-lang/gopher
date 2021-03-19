@@ -1,5 +1,5 @@
 // Derived from Inferno utils/6l/l.h and related files.
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/6l/l.h
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/6l/l.h
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -30,7 +30,7 @@
 
 package objabi
 
-type RelocType int32
+type RelocType int16
 
 //go:generate stringer -type=RelocType
 const (
@@ -50,11 +50,6 @@ const (
 	// R_ADDROFF resolves to a 32-bit offset from the beginning of the section
 	// holding the data being relocated to the referenced symbol.
 	R_ADDROFF
-	// R_WEAKADDROFF resolves just like R_ADDROFF but is a weak relocation.
-	// A weak relocation does not make the symbol it refers to reachable,
-	// and is only honored by the linker if the symbol is in some other way
-	// reachable.
-	R_WEAKADDROFF
 	R_SIZE
 	R_CALL
 	R_CALLARM
@@ -64,6 +59,8 @@ const (
 	// R_CALLMIPS (only used on mips64) resolves to non-PC-relative target address
 	// of a CALL (JAL) instruction, by encoding the address into the instruction.
 	R_CALLMIPS
+	// R_CALLRISCV marks RISC-V CALLs for stack checking.
+	R_CALLRISCV
 	R_CONST
 	R_PCREL
 	// R_TLS_LE, used on 386, amd64, and ARM, resolves to the offset of the
@@ -87,6 +84,17 @@ const (
 	// should be linked into the final binary, even if there are no other
 	// direct references. (This is used for types reachable by reflection.)
 	R_USETYPE
+	// R_USEIFACE marks a type is converted to an interface in the function this
+	// relocation is applied to. The target is a type descriptor.
+	// This is a marker relocation (0-sized), for the linker's reachabililty
+	// analysis.
+	R_USEIFACE
+	// R_USEIFACEMETHOD marks an interface method that is used in the function
+	// this relocation is applied to. The target is an interface type descriptor.
+	// The addend is the offset of the method in the type descriptor.
+	// This is a marker relocation (0-sized), for the linker's reachabililty
+	// analysis.
+	R_USEIFACEMETHOD
 	// R_METHODOFF resolves to a 32-bit offset from the beginning of the section
 	// holding the data being relocated to the referenced symbol.
 	// It is a variant of R_ADDROFF used when linking from the uncommonType of a
@@ -131,6 +139,29 @@ const (
 	// R_ARM64_GOTPCREL relocates an adrp, ld64 pair to compute the address of the GOT
 	// slot of the referenced symbol.
 	R_ARM64_GOTPCREL
+
+	// R_ARM64_GOT resolves a GOT-relative instruction sequence, usually an adrp
+	// followed by another ld instruction.
+	R_ARM64_GOT
+
+	// R_ARM64_PCREL resolves a PC-relative addresses instruction sequence, usually an
+	// adrp followed by another add instruction.
+	R_ARM64_PCREL
+
+	// R_ARM64_LDST8 sets a LD/ST immediate value to bits [11:0] of a local address.
+	R_ARM64_LDST8
+
+	// R_ARM64_LDST16 sets a LD/ST immediate value to bits [11:1] of a local address.
+	R_ARM64_LDST16
+
+	// R_ARM64_LDST32 sets a LD/ST immediate value to bits [11:2] of a local address.
+	R_ARM64_LDST32
+
+	// R_ARM64_LDST64 sets a LD/ST immediate value to bits [11:3] of a local address.
+	R_ARM64_LDST64
+
+	// R_ARM64_LDST128 sets a LD/ST immediate value to bits [11:4] of a local address.
+	R_ARM64_LDST128
 
 	// PPC64.
 
@@ -180,6 +211,24 @@ const (
 	// relocated symbol rather than the symbol's address.
 	R_ADDRPOWER_TOCREL_DS
 
+	// RISC-V.
+
+	// R_RISCV_PCREL_ITYPE resolves a 32-bit PC-relative address using an
+	// AUIPC + I-type instruction pair.
+	R_RISCV_PCREL_ITYPE
+
+	// R_RISCV_PCREL_STYPE resolves a 32-bit PC-relative address using an
+	// AUIPC + S-type instruction pair.
+	R_RISCV_PCREL_STYPE
+
+	// R_RISCV_TLS_IE_ITYPE resolves a 32-bit TLS initial-exec TOC offset
+	// address using an AUIPC + I-type instruction pair.
+	R_RISCV_TLS_IE_ITYPE
+
+	// R_RISCV_TLS_IE_STYPE resolves a 32-bit TLS initial-exec TOC offset
+	// address using an AUIPC + S-type instruction pair.
+	R_RISCV_TLS_IE_STYPE
+
 	// R_PCRELDBL relocates s390x 2-byte aligned PC-relative addresses.
 	// TODO(mundaym): remove once variants can be serialized - see issue 14218.
 	R_PCRELDBL
@@ -190,24 +239,56 @@ const (
 	// R_ADDRMIPSTLS (only used on mips64) resolves to the low 16 bits of a TLS
 	// address (offset from thread pointer), by encoding it into the instruction.
 	R_ADDRMIPSTLS
+
 	// R_ADDRCUOFF resolves to a pointer-sized offset from the start of the
 	// symbol's DWARF compile unit.
 	R_ADDRCUOFF
 
 	// R_WASMIMPORT resolves to the index of the WebAssembly function import.
 	R_WASMIMPORT
+
+	// R_XCOFFREF (only used on aix/ppc64) prevents garbage collection by ld
+	// of a symbol. This isn't a real relocation, it can be placed in anywhere
+	// in a symbol and target any symbols.
+	R_XCOFFREF
+
+	// R_WEAK marks the relocation as a weak reference.
+	// A weak relocation does not make the symbol it refers to reachable,
+	// and is only honored by the linker if the symbol is in some other way
+	// reachable.
+	R_WEAK = -1 << 15
+
+	R_WEAKADDROFF = R_WEAK | R_ADDROFF
 )
 
-// IsDirectJump returns whether r is a relocation for a direct jump.
-// A direct jump is a CALL or JMP instruction that takes the target address
-// as immediate. The address is embedded into the instruction, possibly
-// with limited width.
-// An indirect jump is a CALL or JMP instruction that takes the target address
-// in register or memory.
-func (r RelocType) IsDirectJump() bool {
+// IsDirectCall reports whether r is a relocation for a direct call.
+// A direct call is a CALL instruction that takes the target address
+// as an immediate. The address is embedded into the instruction, possibly
+// with limited width. An indirect call is a CALL instruction that takes
+// the target address in register or memory.
+func (r RelocType) IsDirectCall() bool {
 	switch r {
-	case R_CALL, R_CALLARM, R_CALLARM64, R_CALLPOWER, R_CALLMIPS, R_JMPMIPS:
+	case R_CALL, R_CALLARM, R_CALLARM64, R_CALLMIPS, R_CALLPOWER, R_CALLRISCV:
 		return true
 	}
 	return false
+}
+
+// IsDirectJump reports whether r is a relocation for a direct jump.
+// A direct jump is a JMP instruction that takes the target address
+// as an immediate. The address is embedded into the instruction, possibly
+// with limited width. An indirect jump is a JMP instruction that takes
+// the target address in register or memory.
+func (r RelocType) IsDirectJump() bool {
+	switch r {
+	case R_JMPMIPS:
+		return true
+	}
+	return false
+}
+
+// IsDirectCallOrJump reports whether r is a relocation for a direct
+// call or a direct jump.
+func (r RelocType) IsDirectCallOrJump() bool {
+	return r.IsDirectCall() || r.IsDirectJump()
 }

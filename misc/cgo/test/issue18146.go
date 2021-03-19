@@ -8,8 +8,6 @@
 
 package cgotest
 
-import "C"
-
 import (
 	"bytes"
 	"crypto/md5"
@@ -26,7 +24,7 @@ func test18146(t *testing.T) {
 		t.Skip("skipping in short mode")
 	}
 
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
 		t.Skipf("skipping flaky test on %s; see golang.org/issue/18202", runtime.GOOS)
 	}
 
@@ -46,6 +44,8 @@ func test18146(t *testing.T) {
 	switch runtime.GOOS {
 	default:
 		setNproc = false
+	case "aix":
+		nproc = 9
 	case "linux":
 		nproc = 6
 	case "darwin", "dragonfly", "freebsd", "netbsd", "openbsd":

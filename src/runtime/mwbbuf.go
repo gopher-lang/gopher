@@ -23,6 +23,7 @@
 package runtime
 
 import (
+	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
 )
@@ -79,7 +80,7 @@ const (
 func (b *wbBuf) reset() {
 	start := uintptr(unsafe.Pointer(&b.buf[0]))
 	b.next = start
-	if gcBlackenPromptly || writeBarrier.cgo {
+	if writeBarrier.cgo {
 		// Effectively disable the buffer by forcing a flush
 		// on every barrier.
 		b.end = uintptr(unsafe.Pointer(&b.buf[wbBufEntryPointers]))
@@ -105,6 +106,11 @@ func (b *wbBuf) reset() {
 //go:nosplit
 func (b *wbBuf) discard() {
 	b.next = uintptr(unsafe.Pointer(&b.buf[0]))
+}
+
+// empty reports whether b contains no pointers.
+func (b *wbBuf) empty() bool {
+	return b.next == uintptr(unsafe.Pointer(&b.buf[0]))
 }
 
 // putFast adds old and new to the write barrier buffer and returns
@@ -212,14 +218,16 @@ func wbBufFlush1(_p_ *p) {
 	n := (_p_.wbBuf.next - start) / unsafe.Sizeof(_p_.wbBuf.buf[0])
 	ptrs := _p_.wbBuf.buf[:n]
 
-	// Reset the buffer.
-	_p_.wbBuf.reset()
+	// Poison the buffer to make extra sure nothing is enqueued
+	// while we're processing the buffer.
+	_p_.wbBuf.next = 0
 
 	if useCheckmark {
 		// Slow path for checkmark mode.
 		for _, ptr := range ptrs {
 			shade(ptr)
 		}
+		_p_.wbBuf.reset()
 		return
 	}
 
@@ -260,6 +268,13 @@ func wbBufFlush1(_p_ *p) {
 			continue
 		}
 		mbits.setMarked()
+
+		// Mark span.
+		arena, pageIdx, pageMask := pageIndexOf(span.base())
+		if arena.pageMarks[pageIdx]&pageMask == 0 {
+			atomic.Or8(&arena.pageMarks[pageIdx], pageMask)
+		}
+
 		if span.spanclass.noscan() {
 			gcw.bytesMarked += uint64(span.elemsize)
 			continue
@@ -270,9 +285,6 @@ func wbBufFlush1(_p_ *p) {
 
 	// Enqueue the greyed objects.
 	gcw.putBatch(ptrs[:pos])
-	if gcphase == _GCmarktermination || gcBlackenPromptly {
-		// Ps aren't allowed to cache work during mark
-		// termination.
-		gcw.dispose()
-	}
+
+	_p_.wbBuf.reset()
 }

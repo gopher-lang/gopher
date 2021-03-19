@@ -13,6 +13,7 @@
 package runtime
 
 import (
+	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
 )
@@ -54,7 +55,7 @@ const (
 	traceEvGoInSyscall       = 32 // denotes that goroutine is in syscall when tracing starts [timestamp, goroutine id]
 	traceEvHeapAlloc         = 33 // memstats.heap_live change [timestamp, heap_alloc]
 	traceEvNextGC            = 34 // memstats.next_gc change [timestamp, next_gc]
-	traceEvTimerGoroutine    = 35 // denotes timer goroutine [timer goroutine id]
+	traceEvTimerGoroutine    = 35 // not currently used; previously denoted timer goroutine [timer goroutine id]
 	traceEvFutileWakeup      = 36 // denotes that the previous wakeup of this goroutine was futile [timestamp]
 	traceEvString            = 37 // string dictionary entry [ID, length, string]
 	traceEvGoStartLocal      = 38 // goroutine starts running on the same P as the last event [timestamp, goroutine id]
@@ -84,7 +85,7 @@ const (
 	// and ppc64le.
 	// Tracing won't work reliably for architectures where cputicks is emulated
 	// by nanotime, so the value doesn't matter for those architectures.
-	traceTickDiv = 16 + 48*(sys.Goarch386|sys.GoarchAmd64|sys.GoarchAmd64p32)
+	traceTickDiv = 16 + 48*(sys.Goarch386|sys.GoarchAmd64)
 	// Maximum number of PCs in a single stack trace.
 	// Since events contain only stack id rather than whole stack trace,
 	// we can allow quite large values here.
@@ -180,9 +181,15 @@ func traceBufPtrOf(b *traceBuf) traceBufPtr {
 // Most clients should use the runtime/trace package or the testing package's
 // -test.trace flag instead of calling StartTrace directly.
 func StartTrace() error {
-	// Stop the world, so that we can take a consistent snapshot
+	// Stop the world so that we can take a consistent snapshot
 	// of all goroutines at the beginning of the trace.
-	stopTheWorld("start tracing")
+	// Do not stop the world during GC so we ensure we always see
+	// a consistent view of GC-related events (e.g. a start is always
+	// paired with an end).
+	stopTheWorldGC("start tracing")
+
+	// Prevent sysmon from running any code that could generate events.
+	lock(&sched.sysmonlock)
 
 	// We are in stop-the-world, but syscalls can finish and write to trace concurrently.
 	// Exitsyscall could check trace.enabled long before and then suddenly wake up
@@ -193,7 +200,8 @@ func StartTrace() error {
 
 	if trace.enabled || trace.shutdown {
 		unlock(&trace.bufLock)
-		startTheWorld()
+		unlock(&sched.sysmonlock)
+		startTheWorldGC()
 		return errorString("tracing is already enabled")
 	}
 
@@ -213,7 +221,8 @@ func StartTrace() error {
 	stackID := traceStackID(mp, stkBuf, 2)
 	releasem(mp)
 
-	for _, gp := range allgs {
+	// World is stopped, no need to lock.
+	forEachGRace(func(gp *g) {
 		status := readgstatus(gp)
 		if status != _Gdead {
 			gp.traceseq = 0
@@ -233,7 +242,7 @@ func StartTrace() error {
 		} else {
 			gp.sysblocktraced = false
 		}
-	}
+	})
 	traceProcStart()
 	traceGoStart()
 	// Note: ticksStart needs to be set after we emit traceEvGoInSyscall events.
@@ -264,7 +273,9 @@ func StartTrace() error {
 
 	unlock(&trace.bufLock)
 
-	startTheWorld()
+	unlock(&sched.sysmonlock)
+
+	startTheWorldGC()
 	return nil
 }
 
@@ -273,14 +284,18 @@ func StartTrace() error {
 func StopTrace() {
 	// Stop the world so that we can collect the trace buffers from all p's below,
 	// and also to avoid races with traceEvent.
-	stopTheWorld("stop tracing")
+	stopTheWorldGC("stop tracing")
+
+	// See the comment in StartTrace.
+	lock(&sched.sysmonlock)
 
 	// See the comment in StartTrace.
 	lock(&trace.bufLock)
 
 	if !trace.enabled {
 		unlock(&trace.bufLock)
-		startTheWorld()
+		unlock(&sched.sysmonlock)
+		startTheWorldGC()
 		return
 	}
 
@@ -317,7 +332,9 @@ func StopTrace() {
 	trace.shutdown = true
 	unlock(&trace.bufLock)
 
-	startTheWorld()
+	unlock(&sched.sysmonlock)
+
+	startTheWorldGC()
 
 	// The world is started but we've set trace.shutdown, so new tracing can't start.
 	// Wait for the trace reader to flush pending buffers and stop.
@@ -413,13 +430,6 @@ func ReadTrace() []byte {
 		var data []byte
 		data = append(data, traceEvFrequency|0<<traceArgCountShift)
 		data = traceAppend(data, uint64(freq))
-		for i := range timers {
-			tb := &timers[i]
-			if tb.gp != nil {
-				data = append(data, traceEvTimerGoroutine|0<<traceArgCountShift)
-				data = traceAppend(data, uint64(tb.gp.goid))
-			}
-		}
 		// This will emit a bunch of full buffers, we will pick them up
 		// on the next iteration.
 		trace.stackTab.dump()
@@ -873,6 +883,7 @@ func (tab *traceStackTable) dump() {
 
 	tab.mem.drop()
 	*tab = traceStackTable{}
+	lockInit(&((*tab).lock), lockRankTraceStackTab)
 }
 
 type traceFrame struct {
@@ -929,7 +940,7 @@ func (p *traceAllocBlockPtr) set(x *traceAllocBlock) { *p = traceAllocBlockPtr(u
 
 // alloc allocates n-byte block.
 func (a *traceAlloc) alloc(n uintptr) unsafe.Pointer {
-	n = round(n, sys.PtrSize)
+	n = alignUp(n, sys.PtrSize)
 	if a.head == 0 || a.off+n > uintptr(len(a.head.ptr().data)) {
 		if n > uintptr(len(a.head.ptr().data)) {
 			throw("trace: alloc too large")
@@ -1054,7 +1065,7 @@ func traceGoStart() {
 	_g_ := getg().m.curg
 	_p_ := _g_.m.p
 	_g_.traceseq++
-	if _g_ == _p_.ptr().gcBgMarkWorker.ptr() {
+	if _p_.ptr().gcMarkWorkerMode != gcMarkWorkerNotWorker {
 		traceEvent(traceEvGoStartLabel, -1, uint64(_g_.goid), _g_.traceseq, trace.markWorkerLabels[_p_.ptr().gcMarkWorkerMode])
 	} else if _g_.tracelastp == _p_ {
 		traceEvent(traceEvGoStartLocal, -1, uint64(_g_.goid))
@@ -1137,11 +1148,11 @@ func traceHeapAlloc() {
 }
 
 func traceNextGC() {
-	if memstats.next_gc == ^uint64(0) {
+	if nextGC := atomic.Load64(&memstats.next_gc); nextGC == ^uint64(0) {
 		// Heap-based triggering is disabled.
 		traceEvent(traceEvNextGC, -1, 0)
 	} else {
-		traceEvent(traceEvNextGC, -1, memstats.next_gc)
+		traceEvent(traceEvNextGC, -1, nextGC)
 	}
 }
 

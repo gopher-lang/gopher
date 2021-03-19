@@ -21,6 +21,7 @@
 #define SYS_rt_sigaction	13
 #define SYS_rt_sigprocmask	14
 #define SYS_rt_sigreturn	15
+#define SYS_pipe		22
 #define SYS_sched_yield 	24
 #define SYS_mincore		27
 #define SYS_madvise		28
@@ -39,6 +40,7 @@
 #define SYS_futex		202
 #define SYS_sched_getaffinity	204
 #define SYS_epoll_create	213
+#define SYS_clock_gettime	228
 #define SYS_exit_group		231
 #define SYS_epoll_ctl		233
 #define SYS_tgkill		234
@@ -46,6 +48,7 @@
 #define SYS_faccessat		269
 #define SYS_epoll_pwait		281
 #define SYS_epoll_create1	291
+#define SYS_pipe2		293
 
 TEXT runtime·exit(SB),NOSPLIT,$0-4
 	MOVL	code+0(FP), DI
@@ -89,15 +92,12 @@ TEXT runtime·closefd(SB),NOSPLIT,$0-12
 	MOVL	AX, ret+8(FP)
 	RET
 
-TEXT runtime·write(SB),NOSPLIT,$0-28
+TEXT runtime·write1(SB),NOSPLIT,$0-28
 	MOVQ	fd+0(FP), DI
 	MOVQ	p+8(FP), SI
 	MOVL	n+16(FP), DX
 	MOVL	$SYS_write, AX
 	SYSCALL
-	CMPQ	AX, $0xfffffffffffff001
-	JLS	2(PC)
-	MOVL	$-1, AX
 	MOVL	AX, ret+24(FP)
 	RET
 
@@ -107,10 +107,24 @@ TEXT runtime·read(SB),NOSPLIT,$0-28
 	MOVL	n+16(FP), DX
 	MOVL	$SYS_read, AX
 	SYSCALL
-	CMPQ	AX, $0xfffffffffffff001
-	JLS	2(PC)
-	MOVL	$-1, AX
 	MOVL	AX, ret+24(FP)
+	RET
+
+// func pipe() (r, w int32, errno int32)
+TEXT runtime·pipe(SB),NOSPLIT,$0-12
+	LEAQ	r+0(FP), DI
+	MOVL	$SYS_pipe, AX
+	SYSCALL
+	MOVL	AX, errno+8(FP)
+	RET
+
+// func pipe2(flags int32) (r, w int32, errno int32)
+TEXT runtime·pipe2(SB),NOSPLIT,$0-20
+	LEAQ	r+8(FP), DI
+	MOVL	flags+0(FP), SI
+	MOVL	$SYS_pipe2, AX
+	SYSCALL
+	MOVL	AX, errno+16(FP)
 	RET
 
 TEXT runtime·usleep(SB),NOSPLIT,$16
@@ -158,6 +172,20 @@ TEXT runtime·raiseproc(SB),NOSPLIT,$0
 	SYSCALL
 	RET
 
+TEXT ·getpid(SB),NOSPLIT,$0-8
+	MOVL	$SYS_getpid, AX
+	SYSCALL
+	MOVQ	AX, ret+0(FP)
+	RET
+
+TEXT ·tgkill(SB),NOSPLIT,$0
+	MOVQ	tgid+0(FP), DI
+	MOVQ	tid+8(FP), SI
+	MOVQ	sig+16(FP), DX
+	MOVL	$SYS_tgkill, AX
+	SYSCALL
+	RET
+
 TEXT runtime·setitimer(SB),NOSPLIT,$0-24
 	MOVL	mode+0(FP), DI
 	MOVQ	new+8(FP), SI
@@ -175,8 +203,9 @@ TEXT runtime·mincore(SB),NOSPLIT,$0-28
 	MOVL	AX, ret+24(FP)
 	RET
 
-// func walltime() (sec int64, nsec int32)
-TEXT runtime·walltime(SB),NOSPLIT,$0-12
+// func walltime1() (sec int64, nsec int32)
+// non-zero frame-size means bp is saved and restored
+TEXT runtime·walltime1(SB),NOSPLIT,$16-12
 	// We don't know how much stack space the VDSO code will need,
 	// so switch to g0.
 	// In particular, a kernel configured with CONFIG_OPTIMIZE_INLINING=n
@@ -184,19 +213,34 @@ TEXT runtime·walltime(SB),NOSPLIT,$0-12
 	// due to stack probes inserted to avoid stack/heap collisions.
 	// See issue #20427.
 
-	MOVQ	SP, BP	// Save old SP; BP unchanged by C code.
+	MOVQ	SP, R12	// Save old SP; R12 unchanged by C code.
 
+#ifdef GOEXPERIMENT_REGABI_G
+	MOVQ	g_m(R14), BX // BX unchanged by C code.
+#else
 	get_tls(CX)
 	MOVQ	g(CX), AX
 	MOVQ	g_m(AX), BX // BX unchanged by C code.
+#endif
 
 	// Set vdsoPC and vdsoSP for SIGPROF traceback.
-	MOVQ	0(SP), DX
-	MOVQ	DX, m_vdsoPC(BX)
-	LEAQ	sec+0(SP), DX
+	// Save the old values on stack and restore them on exit,
+	// so this function is reentrant.
+	MOVQ	m_vdsoPC(BX), CX
+	MOVQ	m_vdsoSP(BX), DX
+	MOVQ	CX, 0(SP)
+	MOVQ	DX, 8(SP)
+
+	LEAQ	sec+0(FP), DX
+	MOVQ	-8(DX), CX
+	MOVQ	CX, m_vdsoPC(BX)
 	MOVQ	DX, m_vdsoSP(BX)
 
+#ifdef GOEXPERIMENT_REGABI_G
+	CMPQ	R14, m_curg(BX)	// Only switch if on curg.
+#else
 	CMPQ	AX, m_curg(BX)	// Only switch if on curg.
+#endif
 	JNE	noswitch
 
 	MOVQ	m_g0(BX), DX
@@ -206,49 +250,65 @@ noswitch:
 	SUBQ	$16, SP		// Space for results
 	ANDQ	$~15, SP	// Align for C code
 
-	MOVQ	runtime·vdsoClockgettimeSym(SB), AX
-	CMPQ	AX, $0
-	JEQ	fallback
 	MOVL	$0, DI // CLOCK_REALTIME
 	LEAQ	0(SP), SI
+	MOVQ	runtime·vdsoClockgettimeSym(SB), AX
+	CMPQ	AX, $0
+	JEQ	fallback
 	CALL	AX
+ret:
 	MOVQ	0(SP), AX	// sec
 	MOVQ	8(SP), DX	// nsec
-	MOVQ	BP, SP		// Restore real SP
-	MOVQ	$0, m_vdsoSP(BX)
+	MOVQ	R12, SP		// Restore real SP
+	// Restore vdsoPC, vdsoSP
+	// We don't worry about being signaled between the two stores.
+	// If we are not in a signal handler, we'll restore vdsoSP to 0,
+	// and no one will care about vdsoPC. If we are in a signal handler,
+	// we cannot receive another signal.
+	MOVQ	8(SP), CX
+	MOVQ	CX, m_vdsoSP(BX)
+	MOVQ	0(SP), CX
+	MOVQ	CX, m_vdsoPC(BX)
 	MOVQ	AX, sec+0(FP)
 	MOVL	DX, nsec+8(FP)
 	RET
 fallback:
-	LEAQ	0(SP), DI
-	MOVQ	$0, SI
-	MOVQ	runtime·vdsoGettimeofdaySym(SB), AX
-	CALL	AX
-	MOVQ	0(SP), AX	// sec
-	MOVL	8(SP), DX	// usec
-	IMULQ	$1000, DX
-	MOVQ	BP, SP		// Restore real SP
-	MOVQ	$0, m_vdsoSP(BX)
-	MOVQ	AX, sec+0(FP)
-	MOVL	DX, nsec+8(FP)
-	RET
+	MOVQ	$SYS_clock_gettime, AX
+	SYSCALL
+	JMP ret
 
-TEXT runtime·nanotime(SB),NOSPLIT,$0-8
+// func nanotime1() int64
+TEXT runtime·nanotime1(SB),NOSPLIT,$16-8
 	// Switch to g0 stack. See comment above in runtime·walltime.
 
-	MOVQ	SP, BP	// Save old SP; BP unchanged by C code.
+	MOVQ	SP, R12	// Save old SP; R12 unchanged by C code.
 
+#ifdef GOEXPERIMENT_REGABI_G
+	MOVQ	g_m(R14), BX // BX unchanged by C code.
+#else
 	get_tls(CX)
 	MOVQ	g(CX), AX
 	MOVQ	g_m(AX), BX // BX unchanged by C code.
+#endif
 
 	// Set vdsoPC and vdsoSP for SIGPROF traceback.
-	MOVQ	0(SP), DX
-	MOVQ	DX, m_vdsoPC(BX)
-	LEAQ	ret+0(SP), DX
+	// Save the old values on stack and restore them on exit,
+	// so this function is reentrant.
+	MOVQ	m_vdsoPC(BX), CX
+	MOVQ	m_vdsoSP(BX), DX
+	MOVQ	CX, 0(SP)
+	MOVQ	DX, 8(SP)
+
+	LEAQ	ret+0(FP), DX
+	MOVQ	-8(DX), CX
+	MOVQ	CX, m_vdsoPC(BX)
 	MOVQ	DX, m_vdsoSP(BX)
 
+#ifdef GOEXPERIMENT_REGABI_G
+	CMPQ	R14, m_curg(BX)	// Only switch if on curg.
+#else
 	CMPQ	AX, m_curg(BX)	// Only switch if on curg.
+#endif
 	JNE	noswitch
 
 	MOVQ	m_g0(BX), DX
@@ -258,16 +318,25 @@ noswitch:
 	SUBQ	$16, SP		// Space for results
 	ANDQ	$~15, SP	// Align for C code
 
+	MOVL	$1, DI // CLOCK_MONOTONIC
+	LEAQ	0(SP), SI
 	MOVQ	runtime·vdsoClockgettimeSym(SB), AX
 	CMPQ	AX, $0
 	JEQ	fallback
-	MOVL	$1, DI // CLOCK_MONOTONIC
-	LEAQ	0(SP), SI
 	CALL	AX
+ret:
 	MOVQ	0(SP), AX	// sec
 	MOVQ	8(SP), DX	// nsec
-	MOVQ	BP, SP		// Restore real SP
-	MOVQ	$0, m_vdsoSP(BX)
+	MOVQ	R12, SP		// Restore real SP
+	// Restore vdsoPC, vdsoSP
+	// We don't worry about being signaled between the two stores.
+	// If we are not in a signal handler, we'll restore vdsoSP to 0,
+	// and no one will care about vdsoPC. If we are in a signal handler,
+	// we cannot receive another signal.
+	MOVQ	8(SP), CX
+	MOVQ	CX, m_vdsoSP(BX)
+	MOVQ	0(SP), CX
+	MOVQ	CX, m_vdsoPC(BX)
 	// sec is in AX, nsec in DX
 	// return nsec in AX
 	IMULQ	$1000000000, AX
@@ -275,21 +344,9 @@ noswitch:
 	MOVQ	AX, ret+0(FP)
 	RET
 fallback:
-	LEAQ	0(SP), DI
-	MOVQ	$0, SI
-	MOVQ	runtime·vdsoGettimeofdaySym(SB), AX
-	CALL	AX
-	MOVQ	0(SP), AX	// sec
-	MOVL	8(SP), DX	// usec
-	MOVQ	BP, SP		// Restore real SP
-	MOVQ	$0, m_vdsoSP(BX)
-	IMULQ	$1000, DX
-	// sec is in AX, nsec in DX
-	// return nsec in AX
-	IMULQ	$1000000000, AX
-	ADDQ	DX, AX
-	MOVQ	AX, ret+0(FP)
-	RET
+	MOVQ	$SYS_clock_gettime, AX
+	SYSCALL
+	JMP	ret
 
 TEXT runtime·rtsigprocmask(SB),NOSPLIT,$0-28
 	MOVL	how+0(FP), DI
@@ -339,7 +396,8 @@ TEXT runtime·sigfwd(SB),NOSPLIT,$0-32
 	POPQ	BP
 	RET
 
-TEXT runtime·sigtramp(SB),NOSPLIT,$72
+// Defined as ABIInternal since it does not use the stack-based Go ABI.
+TEXT runtime·sigtramp<ABIInternal>(SB),NOSPLIT,$72
 	// Save callee-saved C registers, since the caller may be a C signal handler.
 	MOVQ	BX,  bx-8(SP)
 	MOVQ	BP,  bp-16(SP)  // save in case GOEXPERIMENT=noframepointer is set
@@ -366,7 +424,8 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$72
 
 // Used instead of sigtramp in programs that use cgo.
 // Arguments from kernel are in DI, SI, DX.
-TEXT runtime·cgoSigtramp(SB),NOSPLIT,$0
+// Defined as ABIInternal since it does not use the stack-based Go ABI.
+TEXT runtime·cgoSigtramp<ABIInternal>(SB),NOSPLIT,$0
 	// If no traceback function, do usual sigtramp.
 	MOVQ	runtime·cgoTraceback(SB), AX
 	TESTQ	AX, AX
@@ -409,12 +468,12 @@ TEXT runtime·cgoSigtramp(SB),NOSPLIT,$0
 	// The first three arguments, and the fifth, are already in registers.
 	// Set the two remaining arguments now.
 	MOVQ	runtime·cgoTraceback(SB), CX
-	MOVQ	$runtime·sigtramp(SB), R9
+	MOVQ	$runtime·sigtramp<ABIInternal>(SB), R9
 	MOVQ	_cgo_callers(SB), AX
 	JMP	AX
 
 sigtramp:
-	JMP	runtime·sigtramp(SB)
+	JMP	runtime·sigtramp<ABIInternal>(SB)
 
 sigtrampnog:
 	// Signal arrived on a non-Go thread. If this is SIGPROF, get a
@@ -445,7 +504,8 @@ sigtrampnog:
 // https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/unix/sysv/linux/x86_64/sigaction.c
 // The code that cares about the precise instructions used is:
 // https://gcc.gnu.org/viewcvs/gcc/trunk/libgcc/config/i386/linux-unwind.h?revision=219188&view=markup
-TEXT runtime·sigreturn(SB),NOSPLIT,$0
+// Defined as ABIInternal since it does not use the stack-based Go ABI.
+TEXT runtime·sigreturn<ABIInternal>(SB),NOSPLIT,$0
 	MOVQ	$SYS_rt_sigreturn, AX
 	SYSCALL
 	INT $3	// not reached
@@ -542,13 +602,25 @@ TEXT runtime·clone(SB),NOSPLIT,$0
 	MOVQ	stk+8(FP), SI
 	MOVQ	$0, DX
 	MOVQ	$0, R10
-
+	MOVQ    $0, R8
 	// Copy mp, gp, fn off parent stack for use by child.
 	// Careful: Linux system call clobbers CX and R11.
-	MOVQ	mp+16(FP), R8
+	MOVQ	mp+16(FP), R13
 	MOVQ	gp+24(FP), R9
 	MOVQ	fn+32(FP), R12
-
+	CMPQ	R13, $0    // m
+	JEQ	nog1
+	CMPQ	R9, $0    // g
+	JEQ	nog1
+	LEAQ	m_tls(R13), R8
+#ifdef GOOS_android
+	// Android stores the TLS offset in runtime·tls_g.
+	SUBQ	runtime·tls_g(SB), R8
+#else
+	ADDQ	$8, R8	// ELF wants to use -8(FS)
+#endif
+	ORQ 	$0x00080000, DI //add flag CLONE_SETTLS(0x00080000) to call clone
+nog1:
 	MOVL	$SYS_clone, AX
 	SYSCALL
 
@@ -562,27 +634,24 @@ TEXT runtime·clone(SB),NOSPLIT,$0
 	MOVQ	SI, SP
 
 	// If g or m are nil, skip Go-related setup.
-	CMPQ	R8, $0    // m
-	JEQ	nog
+	CMPQ	R13, $0    // m
+	JEQ	nog2
 	CMPQ	R9, $0    // g
-	JEQ	nog
+	JEQ	nog2
 
 	// Initialize m->procid to Linux tid
 	MOVL	$SYS_gettid, AX
 	SYSCALL
-	MOVQ	AX, m_procid(R8)
-
-	// Set FS to point at m->tls.
-	LEAQ	m_tls(R8), DI
-	CALL	runtime·settls(SB)
+	MOVQ	AX, m_procid(R13)
 
 	// In child, set up new stack
 	get_tls(CX)
-	MOVQ	R8, g_m(R9)
+	MOVQ	R13, g_m(R9)
 	MOVQ	R9, g(CX)
+	MOVQ	R9, R14 // set g register
 	CALL	runtime·stackcheck(SB)
 
-nog:
+nog2:
 	// Call fn
 	CALL	R12
 
@@ -605,10 +674,8 @@ TEXT runtime·sigaltstack(SB),NOSPLIT,$-8
 // set tls base to DI
 TEXT runtime·settls(SB),NOSPLIT,$32
 #ifdef GOOS_android
-	// Same as in sys_darwin_386.s:/ugliness, different constant.
-	// DI currently holds m->tls, which must be fs:0x1d0.
-	// See cgo/gcc_android_amd64.c for the derivation of the constant.
-	SUBQ	$0x1d0, DI  // In android, the tls base 
+	// Android stores the TLS offset in runtime·tls_g.
+	SUBQ	runtime·tls_g(SB), DI
 #else
 	ADDQ	$8, DI	// ELF wants to use -8(FS)
 #endif
@@ -684,6 +751,20 @@ TEXT runtime·closeonexec(SB),NOSPLIT,$0
 	SYSCALL
 	RET
 
+// func runtime·setNonblock(int32 fd)
+TEXT runtime·setNonblock(SB),NOSPLIT,$0-4
+	MOVL    fd+0(FP), DI  // fd
+	MOVQ    $3, SI  // F_GETFL
+	MOVQ    $0, DX
+	MOVL	$SYS_fcntl, AX
+	SYSCALL
+	MOVL	fd+0(FP), DI // fd
+	MOVQ	$4, SI // F_SETFL
+	MOVQ	$0x800, DX // O_NONBLOCK
+	ORL	AX, DX
+	MOVL	$SYS_fcntl, AX
+	SYSCALL
+	RET
 
 // int access(const char *name, int mode)
 TEXT runtime·access(SB),NOSPLIT,$0

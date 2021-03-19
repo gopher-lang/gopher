@@ -1,5 +1,5 @@
 // Inferno utils/6c/6.out.h
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/6c/6.out.h
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/6c/6.out.h
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -263,6 +263,7 @@ const (
 	FREGRET  = REG_X0
 	REGSP    = REG_SP
 	REGCTXT  = REG_DX
+	REGG     = REG_R14     // g register in ABIInternal
 	REGEXT   = REG_R15     // compiler allocates external registers R15 down
 	FREGMIN  = REG_X0 + 5  // first register variable
 	FREGEXT  = REG_X0 + 15 // first external register

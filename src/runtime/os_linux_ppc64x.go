@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build linux && (ppc64 || ppc64le)
 // +build linux
 // +build ppc64 ppc64le
 
@@ -20,3 +21,5 @@ func archauxv(tag, val uintptr) {
 		cpu.HWCap2 = uint(val)
 	}
 }
+
+func osArchInit() {}

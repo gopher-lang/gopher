@@ -5,10 +5,12 @@
 package net_test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"time"
 )
 
 func ExampleListener() {
@@ -34,6 +36,43 @@ func ExampleListener() {
 			// Shut down the connection.
 			c.Close()
 		}(conn)
+	}
+}
+
+func ExampleDialer() {
+	var d net.Dialer
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	conn, err := d.DialContext(ctx, "tcp", "localhost:12345")
+	if err != nil {
+		log.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("Hello, World!")); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func ExampleDialer_unix() {
+	// DialUnix does not take a context.Context parameter. This example shows
+	// how to dial a Unix socket with a Context. Note that the Context only
+	// applies to the dial operation; it does not apply to the connection once
+	// it has been established.
+	var d net.Dialer
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	d.LocalAddr = nil // if you have a local addr, add it here
+	raddr := net.UnixAddr{Name: "/path/to/unix.sock", Net: "unix"}
+	conn, err := d.DialContext(ctx, "unix", raddr.String())
+	if err != nil {
+		log.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("Hello, socket!")); err != nil {
+		log.Fatal(err)
 	}
 }
 

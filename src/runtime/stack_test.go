@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	_ "unsafe" // for go:linkname
 )
 
 // TestStackMem measures per-thread stack segment cache behavior.
@@ -78,6 +79,10 @@ func TestStackMem(t *testing.T) {
 
 // Test stack growing in different contexts.
 func TestStackGrowth(t *testing.T) {
+	if *flagQuick {
+		t.Skip("-quick")
+	}
+
 	if GOARCH == "wasm" {
 		t.Skip("fails on wasm (too slow?)")
 	}
@@ -783,4 +788,107 @@ func TestTracebackAncestors(t *testing.T) {
 			t.Errorf("output does not contain %d instances of %q:\n%s", count, want, output)
 		}
 	}
+}
+
+// Test that defer closure is correctly scanned when the stack is scanned.
+func TestDeferLiveness(t *testing.T) {
+	output := runTestProg(t, "testprog", "DeferLiveness", "GODEBUG=clobberfree=1")
+	if output != "" {
+		t.Errorf("output:\n%s\n\nwant no output", output)
+	}
+}
+
+func TestDeferHeapAndStack(t *testing.T) {
+	P := 4     // processors
+	N := 10000 //iterations
+	D := 200   // stack depth
+
+	if testing.Short() {
+		P /= 2
+		N /= 10
+		D /= 10
+	}
+	c := make(chan bool)
+	for p := 0; p < P; p++ {
+		go func() {
+			for i := 0; i < N; i++ {
+				if deferHeapAndStack(D) != 2*D {
+					panic("bad result")
+				}
+			}
+			c <- true
+		}()
+	}
+	for p := 0; p < P; p++ {
+		<-c
+	}
+}
+
+// deferHeapAndStack(n) computes 2*n
+func deferHeapAndStack(n int) (r int) {
+	if n == 0 {
+		return 0
+	}
+	if n%2 == 0 {
+		// heap-allocated defers
+		for i := 0; i < 2; i++ {
+			defer func() {
+				r++
+			}()
+		}
+	} else {
+		// stack-allocated defers
+		defer func() {
+			r++
+		}()
+		defer func() {
+			r++
+		}()
+	}
+	r = deferHeapAndStack(n - 1)
+	escapeMe(new([1024]byte)) // force some GCs
+	return
+}
+
+// Pass a value to escapeMe to force it to escape.
+var escapeMe = func(x interface{}) {}
+
+// Test that when F -> G is inlined and F is excluded from stack
+// traces, G still appears.
+func TestTracebackInlineExcluded(t *testing.T) {
+	defer func() {
+		recover()
+		buf := make([]byte, 4<<10)
+		stk := string(buf[:Stack(buf, false)])
+
+		t.Log(stk)
+
+		if not := "tracebackExcluded"; strings.Contains(stk, not) {
+			t.Errorf("found but did not expect %q", not)
+		}
+		if want := "tracebackNotExcluded"; !strings.Contains(stk, want) {
+			t.Errorf("expected %q in stack", want)
+		}
+	}()
+	tracebackExcluded()
+}
+
+// tracebackExcluded should be excluded from tracebacks. There are
+// various ways this could come up. Linking it to a "runtime." name is
+// rather synthetic, but it's easy and reliable. See issue #42754 for
+// one way this happened in real code.
+//
+//go:linkname tracebackExcluded runtime.tracebackExcluded
+//go:noinline
+func tracebackExcluded() {
+	// Call an inlined function that should not itself be excluded
+	// from tracebacks.
+	tracebackNotExcluded()
+}
+
+// tracebackNotExcluded should be inlined into tracebackExcluded, but
+// should not itself be excluded from the traceback.
+func tracebackNotExcluded() {
+	var x *int
+	*x = 0
 }

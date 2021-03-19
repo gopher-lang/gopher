@@ -82,18 +82,21 @@ func sigpanic() {
 	note := gostringnocopy((*byte)(unsafe.Pointer(g.m.notesig)))
 	switch g.sig {
 	case _SIGRFAULT, _SIGWFAULT:
-		i := index(note, "addr=")
+		i := indexNoFloat(note, "addr=")
 		if i >= 0 {
 			i += 5
-		} else if i = index(note, "va="); i >= 0 {
+		} else if i = indexNoFloat(note, "va="); i >= 0 {
 			i += 3
 		} else {
 			panicmem()
 		}
 		addr := note[i:]
 		g.sigcode1 = uintptr(atolwhex(addr))
-		if g.sigcode1 < 0x1000 || g.paniconfault {
+		if g.sigcode1 < 0x1000 {
 			panicmem()
+		}
+		if g.paniconfault {
+			panicmemAddr(g.sigcode1)
 		}
 		print("unexpected fault address ", hex(g.sigcode1), "\n")
 		throw("fault")
@@ -109,6 +112,20 @@ func sigpanic() {
 	default:
 		panic(errorString(note))
 	}
+}
+
+// indexNoFloat is bytealg.IndexString but safe to use in a note
+// handler.
+func indexNoFloat(s, t string) int {
+	if len(t) == 0 {
+		return 0
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == t[0] && hasPrefix(s[i:], t) {
+			return i
+		}
+	}
+	return -1
 }
 
 func atolwhex(p string) int64 {
@@ -167,7 +184,7 @@ func mpreinit(mp *m) {
 	mp.errstr = (*byte)(mallocgc(_ERRMAX, nil, true))
 }
 
-func msigsave(mp *m) {
+func sigsave(p *sigset) {
 }
 
 func msigrestore(sigmask sigset) {
@@ -178,7 +195,7 @@ func msigrestore(sigmask sigset) {
 func clearSignalHandlers() {
 }
 
-func sigblock() {
+func sigblock(exiting bool) {
 }
 
 // Called to initialize a new m (including the bootstrap m).
@@ -194,6 +211,11 @@ func minit() {
 
 // Called from dropm to undo the effect of an minit.
 func unminit() {
+}
+
+// Called from exitm, but not from drop, to undo the effect of thread-owned
+// resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+func mdestroy(mp *m) {
 }
 
 var sysstat = []byte("/dev/sysstat\x00")
@@ -293,7 +315,6 @@ func osinit() {
 	ncpu = getproccount()
 	physPageSize = getPageSize()
 	getg().m.procid = getpid()
-	notify(unsafe.Pointer(funcPC(sigtramp)))
 }
 
 //go:nosplit
@@ -307,15 +328,20 @@ func getRandomData(r []byte) {
 	extendRandom(r, 0)
 }
 
-func goenvs() {
-}
-
 func initsig(preinit bool) {
+	if !preinit {
+		notify(unsafe.Pointer(funcPC(sigtramp)))
+	}
 }
 
 //go:nosplit
 func osyield() {
 	sleep(0)
+}
+
+//go:nosplit
+func osyield_no_g() {
+	osyield()
 }
 
 //go:nosplit
@@ -328,7 +354,12 @@ func usleep(µs uint32) {
 }
 
 //go:nosplit
-func nanotime() int64 {
+func usleep_no_g(usec uint32) {
+	usleep(usec)
+}
+
+//go:nosplit
+func nanotime1() int64 {
 	var scratch int64
 	ns := nsec(&scratch)
 	// TODO(aram): remove hack after I fix _nsec in the pc64 kernel.
@@ -336,18 +367,6 @@ func nanotime() int64 {
 		return scratch
 	}
 	return ns
-}
-
-//go:nosplit
-func itoa(buf []byte, val uint64) []byte {
-	i := len(buf) - 1
-	for val >= 10 {
-		buf[i] = byte(val%10 + '0')
-		i--
-		val /= 10
-	}
-	buf[i] = byte(val + '0')
-	return buf[i:]
 }
 
 var goexits = []byte("go: exit ")
@@ -385,7 +404,7 @@ func postnote(pid uint64, msg []byte) int {
 		return -1
 	}
 	len := findnull(&msg[0])
-	if write(uintptr(fd), unsafe.Pointer(&msg[0]), int32(len)) != int64(len) {
+	if write1(uintptr(fd), unsafe.Pointer(&msg[0]), int32(len)) != int32(len) {
 		closefd(fd)
 		return -1
 	}
@@ -463,8 +482,8 @@ func read(fd int32, buf unsafe.Pointer, n int32) int32 {
 }
 
 //go:nosplit
-func write(fd uintptr, buf unsafe.Pointer, n int32) int64 {
-	return int64(pwrite(int32(fd), buf, n, -1))
+func write1(fd uintptr, buf unsafe.Pointer, n int32) int32 {
+	return pwrite(int32(fd), buf, n, -1)
 }
 
 var _badsignal = []byte("runtime: signal received on thread not created by Go.\n")
@@ -494,4 +513,12 @@ func signame(sig uint32) string {
 		return ""
 	}
 	return sigtable[sig].name
+}
+
+const preemptMSupported = false
+
+func preemptM(mp *m) {
+	// Not currently supported.
+	//
+	// TODO: Use a note like we use signals on POSIX OSes
 }

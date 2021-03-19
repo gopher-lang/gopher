@@ -2,22 +2,20 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !nacl
-// +build !js
-// +build !plan9
-// +build !windows
+//go:build !js && !plan9 && !windows
+// +build !js,!plan9,!windows
 
 package os_test
 
 import (
 	"fmt"
-	"internal/poll"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"os"
+	"os/signal"
 	"runtime"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -29,7 +27,7 @@ func TestNonpollableDeadline(t *testing.T) {
 		t.Skipf("skipping on %s", runtime.GOOS)
 	}
 
-	f, err := ioutil.TempFile("", "ostest")
+	f, err := os.CreateTemp("", "ostest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,9 +54,9 @@ var readTimeoutTests = []struct {
 }{
 	// Tests that read deadlines work, even if there's data ready
 	// to be read.
-	{-5 * time.Second, [2]error{poll.ErrTimeout, poll.ErrTimeout}},
+	{-5 * time.Second, [2]error{os.ErrDeadlineExceeded, os.ErrDeadlineExceeded}},
 
-	{50 * time.Millisecond, [2]error{nil, poll.ErrTimeout}},
+	{50 * time.Millisecond, [2]error{nil, os.ErrDeadlineExceeded}},
 }
 
 func TestReadTimeout(t *testing.T) {
@@ -84,7 +82,7 @@ func TestReadTimeout(t *testing.T) {
 			for {
 				n, err := r.Read(b[:])
 				if xerr != nil {
-					if !os.IsTimeout(err) {
+					if !isDeadlineExceeded(err) {
 						t.Fatalf("#%d/%d: %v", i, j, err)
 					}
 				}
@@ -147,9 +145,9 @@ var writeTimeoutTests = []struct {
 }{
 	// Tests that write deadlines work, even if there's buffer
 	// space available to write.
-	{-5 * time.Second, [2]error{poll.ErrTimeout, poll.ErrTimeout}},
+	{-5 * time.Second, [2]error{os.ErrDeadlineExceeded, os.ErrDeadlineExceeded}},
 
-	{10 * time.Millisecond, [2]error{nil, poll.ErrTimeout}},
+	{10 * time.Millisecond, [2]error{nil, os.ErrDeadlineExceeded}},
 }
 
 func TestWriteTimeout(t *testing.T) {
@@ -171,7 +169,7 @@ func TestWriteTimeout(t *testing.T) {
 				for {
 					n, err := w.Write([]byte("WRITE TIMEOUT TEST"))
 					if xerr != nil {
-						if !os.IsTimeout(err) {
+						if !isDeadlineExceeded(err) {
 							t.Fatalf("%d: %v", j, err)
 						}
 					}
@@ -245,7 +243,7 @@ func timeoutReader(r *os.File, d, min, max time.Duration, ch chan<- error) {
 	var n int
 	n, err = r.Read(b)
 	t1 := time.Now()
-	if n != 0 || err == nil || !os.IsTimeout(err) {
+	if n != 0 || err == nil || !isDeadlineExceeded(err) {
 		err = fmt.Errorf("Read did not return (0, timeout): (%d, %v)", n, err)
 		return
 	}
@@ -274,7 +272,7 @@ func TestReadTimeoutFluctuation(t *testing.T) {
 	case <-max.C:
 		t.Fatal("Read took over 1s; expected 0.1s")
 	case err := <-ch:
-		if !os.IsTimeout(err) {
+		if !isDeadlineExceeded(err) {
 			t.Fatal(err)
 		}
 	}
@@ -296,7 +294,7 @@ func timeoutWriter(w *os.File, d, min, max time.Duration, ch chan<- error) {
 		}
 	}
 	t1 := time.Now()
-	if err == nil || !os.IsTimeout(err) {
+	if err == nil || !isDeadlineExceeded(err) {
 		err = fmt.Errorf("Write did not return (any, timeout): (%d, %v)", n, err)
 		return
 	}
@@ -326,7 +324,7 @@ func TestWriteTimeoutFluctuation(t *testing.T) {
 	case <-max.C:
 		t.Fatalf("Write took over %v; expected 0.1s", d)
 	case err := <-ch:
-		if !os.IsTimeout(err) {
+		if !isDeadlineExceeded(err) {
 			t.Fatal(err)
 		}
 	}
@@ -429,7 +427,7 @@ func testVariousDeadlines(t *testing.T) {
 					if err := r.SetDeadline(t0.Add(timeout)); err != nil {
 						t.Error(err)
 					}
-					n, err := io.Copy(ioutil.Discard, r)
+					n, err := io.Copy(io.Discard, r)
 					dt := time.Since(t0)
 					r.Close()
 					actvch <- result{n, err, dt}
@@ -437,7 +435,7 @@ func testVariousDeadlines(t *testing.T) {
 
 				select {
 				case res := <-actvch:
-					if os.IsTimeout(res.err) {
+					if !isDeadlineExceeded(err) {
 						t.Logf("good client timeout after %v, reading %d bytes", res.d, res.n)
 					} else {
 						t.Fatalf("client Copy = %d, %v; want timeout", res.n, res.err)
@@ -493,7 +491,7 @@ func TestReadWriteDeadlineRace(t *testing.T) {
 		var b [1]byte
 		for i := 0; i < N; i++ {
 			_, err := r.Read(b[:])
-			if err != nil && !os.IsTimeout(err) {
+			if err != nil && !isDeadlineExceeded(err) {
 				t.Error("Read returned non-timeout error", err)
 			}
 		}
@@ -503,7 +501,7 @@ func TestReadWriteDeadlineRace(t *testing.T) {
 		var b [1]byte
 		for i := 0; i < N; i++ {
 			_, err := w.Write(b[:])
-			if err != nil && !os.IsTimeout(err) {
+			if err != nil && !isDeadlineExceeded(err) {
 				t.Error("Write returned non-timeout error", err)
 			}
 		}
@@ -512,7 +510,7 @@ func TestReadWriteDeadlineRace(t *testing.T) {
 }
 
 // TestRacyRead tests that it is safe to mutate the input Read buffer
-// immediately after cancelation has occurred.
+// immediately after cancellation has occurred.
 func TestRacyRead(t *testing.T) {
 	t.Parallel()
 
@@ -540,7 +538,7 @@ func TestRacyRead(t *testing.T) {
 				_, err := r.Read(b1)
 				copy(b1, b2) // Mutate b1 to trigger potential race
 				if err != nil {
-					if !os.IsTimeout(err) {
+					if !isDeadlineExceeded(err) {
 						t.Error(err)
 					}
 					r.SetReadDeadline(time.Now().Add(time.Millisecond))
@@ -551,7 +549,7 @@ func TestRacyRead(t *testing.T) {
 }
 
 // TestRacyWrite tests that it is safe to mutate the input Write buffer
-// immediately after cancelation has occurred.
+// immediately after cancellation has occurred.
 func TestRacyWrite(t *testing.T) {
 	t.Parallel()
 
@@ -565,7 +563,7 @@ func TestRacyWrite(t *testing.T) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	go io.Copy(ioutil.Discard, r)
+	go io.Copy(io.Discard, r)
 
 	w.SetWriteDeadline(time.Now().Add(time.Millisecond))
 	for i := 0; i < 10; i++ {
@@ -579,7 +577,7 @@ func TestRacyWrite(t *testing.T) {
 				_, err := w.Write(b1)
 				copy(b1, b2) // Mutate b1 to trigger potential race
 				if err != nil {
-					if !os.IsTimeout(err) {
+					if !isDeadlineExceeded(err) {
 						t.Error(err)
 					}
 					w.SetWriteDeadline(time.Now().Add(time.Millisecond))
@@ -591,6 +589,10 @@ func TestRacyWrite(t *testing.T) {
 
 // Closing a TTY while reading from it should not hang.  Issue 23943.
 func TestTTYClose(t *testing.T) {
+	// Ignore SIGTTIN in case we are running in the background.
+	signal.Ignore(syscall.SIGTTIN)
+	defer signal.Reset(syscall.SIGTTIN)
+
 	f, err := os.Open("/dev/tty")
 	if err != nil {
 		t.Skipf("skipping because opening /dev/tty failed: %v", err)

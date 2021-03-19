@@ -374,7 +374,7 @@ func (c *config) checkRuntime() (skip bool, err error) {
 	}
 
 	// libcgo.h sets CGO_TSAN if it detects TSAN support in the C compiler.
-	// Dump the preprocessor defines to check that that works.
+	// Dump the preprocessor defines to check that works.
 	// (Sometimes it doesn't: see https://golang.org/issue/15983.)
 	cmd, err := cc(c.cFlags...)
 	if err != nil {
@@ -394,7 +394,7 @@ func (c *config) checkRuntime() (skip bool, err error) {
 
 // srcPath returns the path to the given file relative to this test's source tree.
 func srcPath(path string) string {
-	return filepath.Join("src", path)
+	return filepath.Join("testdata", path)
 }
 
 // A tempDir manages a temporary directory within a test.
@@ -439,4 +439,15 @@ func hangProneCmd(name string, arg ...string) *exec.Cmd {
 		Pdeathsig: syscall.SIGKILL,
 	}
 	return cmd
+}
+
+// mSanSupported is a copy of the function cmd/internal/sys.MSanSupported,
+// because the internal pacakage can't be used here.
+func mSanSupported(goos, goarch string) bool {
+	switch goos {
+	case "linux":
+		return goarch == "amd64" || goarch == "arm64"
+	default:
+		return false
+	}
 }

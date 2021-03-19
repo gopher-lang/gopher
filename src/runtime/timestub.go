@@ -5,6 +5,7 @@
 // Declarations for operating systems implementing time.now
 // indirectly, in terms of walltime and nanotime assembly.
 
+//go:build !windows
 // +build !windows
 
 package runtime
@@ -14,5 +15,5 @@ import _ "unsafe" // for go:linkname
 //go:linkname time_now time.now
 func time_now() (sec int64, nsec int32, mono int64) {
 	sec, nsec = walltime()
-	return sec, nsec, nanotime() - startNano
+	return sec, nsec, nanotime()
 }

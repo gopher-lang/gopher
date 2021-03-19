@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build freebsd
 // +build freebsd
 
 package runtime
@@ -97,7 +98,7 @@ func fallback_nanotime() int64
 func fallback_walltime() (sec int64, nsec int32)
 
 //go:nosplit
-func nanotime() int64 {
+func nanotime1() int64 {
 	bt := vdsoClockGettime(_CLOCK_MONOTONIC)
 	if bt == zeroBintime {
 		return fallback_nanotime()
@@ -105,7 +106,7 @@ func nanotime() int64 {
 	return int64((1e9 * uint64(bt.sec)) + ((1e9 * uint64(bt.frac>>32)) >> 32))
 }
 
-func walltime() (sec int64, nsec int32) {
+func walltime1() (sec int64, nsec int32) {
 	bt := vdsoClockGettime(_CLOCK_REALTIME)
 	if bt == zeroBintime {
 		return fallback_walltime()

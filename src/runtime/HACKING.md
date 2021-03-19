@@ -205,8 +205,10 @@ marked `//go:notinheap` (see below).
 Objects that are allocated in unmanaged memory **must not** contain
 heap pointers unless the following rules are also obeyed:
 
-1. Any pointers from unmanaged memory to the heap must be added as
-   explicit garbage collection roots in `runtime.markroot`.
+1. Any pointers from unmanaged memory to the heap must be garbage
+   collection roots. More specifically, any pointer must either be
+   accessible through a global variable or be added as an explicit
+   garbage collection root in `runtime.markroot`.
 
 2. If the memory is reused, the heap pointers must be zero-initialized
    before they become visible as GC roots. Otherwise, the GC may
@@ -279,11 +281,12 @@ go:notinheap
 ------------
 
 `go:notinheap` applies to type declarations. It indicates that a type
-must never be allocated from the GC'd heap. Specifically, pointers to
-this type must always fail the `runtime.inheap` check. The type may be
-used for global variables, for stack variables, or for objects in
-unmanaged memory (e.g., allocated with `sysAlloc`, `persistentalloc`,
-`fixalloc`, or from a manually-managed span). Specifically:
+must never be allocated from the GC'd heap or on the stack.
+Specifically, pointers to this type must always fail the
+`runtime.inheap` check. The type may be used for global variables, or
+for objects in unmanaged memory (e.g., allocated with `sysAlloc`,
+`persistentalloc`, `fixalloc`, or from a manually-managed span).
+Specifically:
 
 1. `new(T)`, `make([]T)`, `append([]T, ...)` and implicit heap
    allocation of T are disallowed. (Though implicit allocations are

@@ -2,12 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin dragonfly freebsd linux netbsd openbsd solaris
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
 
 package exec_test
 
 import (
 	"os/user"
+	"runtime"
 	"strconv"
 	"syscall"
 	"testing"
@@ -15,6 +17,10 @@ import (
 )
 
 func TestCredentialNoSetGroups(t *testing.T) {
+	if runtime.GOOS == "android" {
+		t.Skip("unsupported on Android")
+	}
+
 	u, err := user.Current()
 	if err != nil {
 		t.Fatalf("error getting current user: %v", err)

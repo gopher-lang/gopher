@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !js
 // +build !js
 
 package net
@@ -162,13 +163,8 @@ func testWriteToConn(t *testing.T, raddr string) {
 		t.Fatalf("should fail as ErrWriteToConnected: %v", err)
 	}
 	_, _, err = c.(*UDPConn).WriteMsgUDP(b, nil, nil)
-	switch runtime.GOOS {
-	case "nacl": // see golang.org/issue/9252
-		t.Skipf("not implemented yet on %s", runtime.GOOS)
-	default:
-		if err != nil {
-			t.Fatal(err)
-		}
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -205,13 +201,8 @@ func testWriteToPacketConn(t *testing.T, raddr string) {
 		t.Fatalf("should fail as errMissingAddress: %v", err)
 	}
 	_, _, err = c.(*UDPConn).WriteMsgUDP(b, nil, ra)
-	switch runtime.GOOS {
-	case "nacl": // see golang.org/issue/9252
-		t.Skipf("not implemented yet on %s", runtime.GOOS)
-	default:
-		if err != nil {
-			t.Fatal(err)
-		}
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -335,8 +326,10 @@ func TestIPv6LinkLocalUnicastUDP(t *testing.T) {
 
 func TestUDPZeroBytePayload(t *testing.T) {
 	switch runtime.GOOS {
-	case "nacl", "plan9":
+	case "plan9":
 		t.Skipf("not supported on %s", runtime.GOOS)
+	case "darwin", "ios":
+		testenv.SkipFlaky(t, 29225)
 	}
 
 	c, err := newLocalPacketListener("udp")
@@ -353,28 +346,25 @@ func TestUDPZeroBytePayload(t *testing.T) {
 		if n != 0 {
 			t.Errorf("got %d; want 0", n)
 		}
-		c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		c.SetReadDeadline(time.Now().Add(30 * time.Second))
 		var b [1]byte
+		var name string
 		if genericRead {
 			_, err = c.(Conn).Read(b[:])
-			// Read may timeout, it depends on the platform.
-			if err != nil {
-				if nerr, ok := err.(Error); !ok || !nerr.Timeout() {
-					t.Fatal(err)
-				}
-			}
+			name = "Read"
 		} else {
 			_, _, err = c.ReadFrom(b[:])
-			if err != nil {
-				t.Fatal(err)
-			}
+			name = "ReadFrom"
+		}
+		if err != nil {
+			t.Errorf("%s of zero byte packet failed: %v", name, err)
 		}
 	}
 }
 
 func TestUDPZeroByteBuffer(t *testing.T) {
 	switch runtime.GOOS {
-	case "nacl", "plan9":
+	case "plan9":
 		t.Skipf("not supported on %s", runtime.GOOS)
 	}
 
@@ -411,7 +401,7 @@ func TestUDPZeroByteBuffer(t *testing.T) {
 
 func TestUDPReadSizeError(t *testing.T) {
 	switch runtime.GOOS {
-	case "nacl", "plan9":
+	case "plan9":
 		t.Skipf("not supported on %s", runtime.GOOS)
 	}
 
@@ -452,6 +442,27 @@ func TestUDPReadSizeError(t *testing.T) {
 		}
 		if n != len(b1)-1 {
 			t.Fatalf("got %d; want %d", n, len(b1)-1)
+		}
+	}
+}
+
+func BenchmarkWriteToReadFromUDP(b *testing.B) {
+	conn, err := ListenUDP("udp4", &UDPAddr{IP: IPv4(127, 0, 0, 1)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	addr := conn.LocalAddr()
+	buf := make([]byte, 8)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err := conn.WriteTo(buf, addr)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_, _, err = conn.ReadFromUDP(buf)
+		if err != nil {
+			b.Fatal(err)
 		}
 	}
 }

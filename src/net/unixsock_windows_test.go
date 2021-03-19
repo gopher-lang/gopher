@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
 // +build windows
 
 package net
@@ -10,6 +11,7 @@ import (
 	"internal/syscall/windows/registry"
 	"os"
 	"reflect"
+	"runtime"
 	"strconv"
 	"testing"
 )
@@ -33,6 +35,12 @@ func isBuild17063() bool {
 }
 
 func TestUnixConnLocalWindows(t *testing.T) {
+	switch runtime.GOARCH {
+	case "386":
+		t.Skip("not supported on windows/386, see golang.org/issue/27943")
+	case "arm":
+		t.Skip("not supported on windows/arm, see golang.org/issue/28061")
+	}
 	if !isBuild17063() {
 		t.Skip("unix test")
 	}

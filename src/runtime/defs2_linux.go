@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 /*
@@ -61,7 +62,7 @@ const (
 	MADV_DONTNEED   = C.MADV_DONTNEED
 	MADV_FREE       = C.MADV_FREE
 	MADV_HUGEPAGE   = C.MADV_HUGEPAGE
-	MADV_NOHUGEPAGE = C.MADV_HNOUGEPAGE
+	MADV_NOHUGEPAGE = C.MADV_NOHUGEPAGE
 
 	SA_RESTART  = C.SA_RESTART
 	SA_ONSTACK  = C.SA_ONSTACK

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 /*
@@ -122,6 +123,12 @@ type Log2phys_t C.struct_log2phys
 type Fsid C.struct_fsid
 
 type Dirent C.struct_dirent
+
+// File system limits
+
+const (
+	pathMax = C.PATH_MAX
+)
 
 // Sockets
 

@@ -1,6 +1,7 @@
 // Created by cgo -godefs - DO NOT EDIT
 // cgo -godefs types_solaris.go
 
+//go:build amd64 && solaris
 // +build amd64,solaris
 
 package syscall
@@ -59,6 +60,8 @@ type Rlimit struct {
 	Cur uint64
 	Max uint64
 }
+
+type _Pid_t int32
 
 type _Gid_t uint32
 

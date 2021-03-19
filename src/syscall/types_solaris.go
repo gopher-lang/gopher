@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 /*
@@ -100,6 +101,8 @@ type Timeval32 C.struct_timeval32
 type Rusage C.struct_rusage
 
 type Rlimit C.struct_rlimit
+
+type _Pid_t C.pid_t
 
 type _Gid_t C.gid_t
 

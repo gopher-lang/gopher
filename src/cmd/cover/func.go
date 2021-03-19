@@ -15,9 +15,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	exec "internal/execabs"
 	"io"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -189,6 +189,10 @@ func findPkgs(profiles []*Profile) (map[string]*Pkg, error) {
 			pkgs[pkg] = nil
 			list = append(list, pkg)
 		}
+	}
+
+	if len(list) == 0 {
+		return pkgs, nil
 	}
 
 	// Note: usually run as "go tool cover" in which case $GOROOT is set,

@@ -5,11 +5,25 @@
 package net
 
 import (
-	"math/rand"
+	"internal/itoa"
 	"sort"
 
-	"golang_org/x/net/dns/dnsmessage"
+	"golang.org/x/net/dns/dnsmessage"
 )
+
+// provided by runtime
+func fastrand() uint32
+
+func randInt() int {
+	x, y := fastrand(), fastrand()    // 32-bit halves
+	u := uint(x)<<31 ^ uint(int32(y)) // full uint, even on 64-bit systems; avoid 32-bit shift on 32-bit systems
+	i := int(u >> 1)                  // clear sign bit, even on 32-bit systems
+	return i
+}
+
+func randIntn(n int) int {
+	return randInt() % n
+}
 
 // reverseaddr returns the in-addr.arpa. or ip6.arpa. hostname of the IP
 // address addr suitable for rDNS (PTR) record lookup or an error if it fails
@@ -20,7 +34,7 @@ func reverseaddr(addr string) (arpa string, err error) {
 		return "", &DNSError{Err: "unrecognized address", Name: addr}
 	}
 	if ip.To4() != nil {
-		return uitoa(uint(ip[15])) + "." + uitoa(uint(ip[14])) + "." + uitoa(uint(ip[13])) + "." + uitoa(uint(ip[12])) + ".in-addr.arpa.", nil
+		return itoa.Uitoa(uint(ip[15])) + "." + itoa.Uitoa(uint(ip[14])) + "." + itoa.Uitoa(uint(ip[13])) + "." + itoa.Uitoa(uint(ip[12])) + ".in-addr.arpa.", nil
 	}
 	// Must be IPv6
 	buf := make([]byte, 0, len(ip)*4+len("ip6.arpa."))
@@ -75,7 +89,7 @@ func isDomainName(s string) bool {
 	}
 
 	last := byte('.')
-	ok := false // Ok once we've seen a letter.
+	nonNumeric := false // true once we've seen a letter or hyphen
 	partlen := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -83,7 +97,7 @@ func isDomainName(s string) bool {
 		default:
 			return false
 		case 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || c == '_':
-			ok = true
+			nonNumeric = true
 			partlen++
 		case '0' <= c && c <= '9':
 			// fine
@@ -94,6 +108,7 @@ func isDomainName(s string) bool {
 				return false
 			}
 			partlen++
+			nonNumeric = true
 		case c == '.':
 			// Byte before dot cannot be dot, dash.
 			if last == '.' || last == '-' {
@@ -110,7 +125,7 @@ func isDomainName(s string) bool {
 		return false
 	}
 
-	return ok
+	return nonNumeric
 }
 
 // absDomainName returns an absolute domain name which ends with a
@@ -161,7 +176,7 @@ func (addrs byPriorityWeight) shuffleByWeight() {
 	}
 	for sum > 0 && len(addrs) > 1 {
 		s := 0
-		n := rand.Intn(sum)
+		n := randIntn(sum)
 		for i := range addrs {
 			s += int(addrs[i].Weight)
 			if s > n {
@@ -205,7 +220,7 @@ func (s byPref) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 // sort reorders MX records as specified in RFC 5321.
 func (s byPref) sort() {
 	for i := range s {
-		j := rand.Intn(i + 1)
+		j := randIntn(i + 1)
 		s[i], s[j] = s[j], s[i]
 	}
 	sort.Sort(s)

@@ -16,8 +16,11 @@ func SendFile(dstFD *FD, src int, remain int64) (int64, error) {
 		return 0, err
 	}
 	defer dstFD.writeUnlock()
+	if err := dstFD.pd.prepareWrite(dstFD.isFile); err != nil {
+		return 0, err
+	}
 
-	dst := int(dstFD.Sysfd)
+	dst := dstFD.Sysfd
 	var written int64
 	var err error
 	for remain > 0 {
@@ -31,6 +34,9 @@ func SendFile(dstFD *FD, src int, remain int64) (int64, error) {
 			remain -= int64(n)
 		} else if n == 0 && err1 == nil {
 			break
+		}
+		if err1 == syscall.EINTR {
+			continue
 		}
 		if err1 == syscall.EAGAIN {
 			if err1 = dstFD.pd.waitWrite(dstFD.isFile); err1 == nil {

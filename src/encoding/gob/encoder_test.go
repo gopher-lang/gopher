@@ -8,9 +8,8 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -939,7 +938,7 @@ func encodeAndRecover(value interface{}) (encodeErr, panicErr error) {
 		}
 	}()
 
-	encodeErr = NewEncoder(ioutil.Discard).Encode(value)
+	encodeErr = NewEncoder(io.Discard).Encode(value)
 	return
 }
 
@@ -1129,23 +1128,27 @@ func TestBadData(t *testing.T) {
 	}
 }
 
-// TestHugeWriteFails tests that enormous messages trigger an error.
-func TestHugeWriteFails(t *testing.T) {
-	if runtime.GOARCH == "wasm" {
-		t.Skip("out of memory on wasm")
+func TestDecodeErrorMultipleTypes(t *testing.T) {
+	type Test struct {
+		A string
+		B int
 	}
-	if testing.Short() {
-		// Requires allocating a monster, so don't do this from all.bash.
-		t.Skip("skipping huge allocation in short mode")
+	var b bytes.Buffer
+	NewEncoder(&b).Encode(Test{"one", 1})
+
+	var result, result2 Test
+	dec := NewDecoder(&b)
+	err := dec.Decode(&result)
+	if err != nil {
+		t.Errorf("decode: unexpected error %v", err)
 	}
-	huge := make([]byte, tooBig)
-	huge[0] = 7 // Make sure it's not all zeros.
-	buf := new(bytes.Buffer)
-	err := NewEncoder(buf).Encode(huge)
+
+	b.Reset()
+	NewEncoder(&b).Encode(Test{"two", 2})
+	err = dec.Decode(&result2)
 	if err == nil {
-		t.Fatalf("expected error for huge slice")
-	}
-	if !strings.Contains(err.Error(), "message too big") {
-		t.Fatalf("expected 'too big' error; got %s\n", err.Error())
+		t.Errorf("decode: expected duplicate type error, got nil")
+	} else if !strings.Contains(err.Error(), "duplicate type") {
+		t.Errorf("decode: expected duplicate type error, got %s", err.Error())
 	}
 }

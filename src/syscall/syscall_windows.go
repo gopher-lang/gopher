@@ -8,7 +8,10 @@ package syscall
 
 import (
 	errorspkg "errors"
+	"internal/itoa"
+	"internal/oserror"
 	"internal/race"
+	"internal/unsafeheader"
 	"runtime"
 	"sync"
 	"unicode/utf16"
@@ -56,6 +59,29 @@ func UTF16ToString(s []uint16) string {
 	return string(utf16.Decode(s))
 }
 
+// utf16PtrToString is like UTF16ToString, but takes *uint16
+// as a parameter instead of []uint16.
+func utf16PtrToString(p *uint16) string {
+	if p == nil {
+		return ""
+	}
+	// Find NUL terminator.
+	end := unsafe.Pointer(p)
+	n := 0
+	for *(*uint16)(end) != 0 {
+		end = unsafe.Pointer(uintptr(end) + unsafe.Sizeof(*p))
+		n++
+	}
+	// Turn *uint16 into []uint16.
+	var s []uint16
+	hdr := (*unsafeheader.Slice)(unsafe.Pointer(&s))
+	hdr.Data = unsafe.Pointer(p)
+	hdr.Cap = n
+	hdr.Len = n
+	// Decode []uint16 into string.
+	return string(utf16.Decode(s))
+}
+
 // StringToUTF16Ptr returns pointer to the UTF-16 encoding of
 // the UTF-8 string s, with a terminating NUL added. If s
 // contains a NUL byte this function panics instead of
@@ -76,6 +102,12 @@ func UTF16PtrFromString(s string) (*uint16, error) {
 }
 
 // Errno is the Windows error number.
+//
+// Errno values can be tested against error values from the os package
+// using errors.Is. For example:
+//
+//	_, _, err := syscall.Syscall(...)
+//	if errors.Is(err, fs.ErrNotExist) ...
 type Errno uintptr
 
 func langid(pri, sub uint16) uint32 { return uint32(sub)<<10 | uint32(pri) }
@@ -101,13 +133,31 @@ func (e Errno) Error() string {
 	if err != nil {
 		n, err = formatMessage(flags, 0, uint32(e), 0, b, nil)
 		if err != nil {
-			return "winapi error #" + itoa(int(e))
+			return "winapi error #" + itoa.Itoa(int(e))
 		}
 	}
 	// trim terminating \r and \n
 	for ; n > 0 && (b[n-1] == '\n' || b[n-1] == '\r'); n-- {
 	}
 	return string(utf16.Decode(b[:n]))
+}
+
+const _ERROR_BAD_NETPATH = Errno(53)
+
+func (e Errno) Is(target error) bool {
+	switch target {
+	case oserror.ErrPermission:
+		return e == ERROR_ACCESS_DENIED
+	case oserror.ErrExist:
+		return e == ERROR_ALREADY_EXISTS ||
+			e == ERROR_DIR_NOT_EMPTY ||
+			e == ERROR_FILE_EXISTS
+	case oserror.ErrNotExist:
+		return e == ERROR_FILE_NOT_FOUND ||
+			e == _ERROR_BAD_NETPATH ||
+			e == ERROR_PATH_NOT_FOUND
+	}
+	return false
 }
 
 func (e Errno) Temporary() bool {
@@ -123,14 +173,14 @@ func compileCallback(fn interface{}, cleanstack bool) uintptr
 
 // NewCallback converts a Go function to a function pointer conforming to the stdcall calling convention.
 // This is useful when interoperating with Windows code requiring callbacks.
-// The argument is expected to be a function with with one uintptr-sized result. The function must not have arguments with size larger than the size of uintptr.
+// The argument is expected to be a function with one uintptr-sized result. The function must not have arguments with size larger than the size of uintptr.
 func NewCallback(fn interface{}) uintptr {
 	return compileCallback(fn, true)
 }
 
 // NewCallbackCDecl converts a Go function to a function pointer conforming to the cdecl calling convention.
 // This is useful when interoperating with Windows code requiring callbacks.
-// The argument is expected to be a function with with one uintptr-sized result. The function must not have arguments with size larger than the size of uintptr.
+// The argument is expected to be a function with one uintptr-sized result. The function must not have arguments with size larger than the size of uintptr.
 func NewCallbackCDecl(fn interface{}) uintptr {
 	return compileCallback(fn, false)
 }
@@ -164,9 +214,9 @@ func NewCallbackCDecl(fn interface{}) uintptr {
 //sys	SetEndOfFile(handle Handle) (err error)
 //sys	GetSystemTimeAsFileTime(time *Filetime)
 //sys	GetTimeZoneInformation(tzi *Timezoneinformation) (rc uint32, err error) [failretval==0xffffffff]
-//sys	CreateIoCompletionPort(filehandle Handle, cphandle Handle, key uint32, threadcnt uint32) (handle Handle, err error)
-//sys	GetQueuedCompletionStatus(cphandle Handle, qty *uint32, key *uint32, overlapped **Overlapped, timeout uint32) (err error)
-//sys	PostQueuedCompletionStatus(cphandle Handle, qty uint32, key uint32, overlapped *Overlapped) (err error)
+//sys	createIoCompletionPort(filehandle Handle, cphandle Handle, key uintptr, threadcnt uint32) (handle Handle, err error) = CreateIoCompletionPort
+//sys	getQueuedCompletionStatus(cphandle Handle, qty *uint32, key *uintptr, overlapped **Overlapped, timeout uint32) (err error) = GetQueuedCompletionStatus
+//sys	postQueuedCompletionStatus(cphandle Handle, qty uint32, key uintptr, overlapped *Overlapped) (err error) = PostQueuedCompletionStatus
 //sys	CancelIo(s Handle) (err error)
 //sys	CancelIoEx(s Handle, o *Overlapped) (err error)
 //sys	CreateProcess(appName *uint16, commandLine *uint16, procSecurity *SecurityAttributes, threadSecurity *SecurityAttributes, inheritHandles bool, creationFlags uint32, env *uint16, currentDir *uint16, startupInfo *StartupInfo, outProcInfo *ProcessInformation) (err error) = CreateProcessW
@@ -210,7 +260,7 @@ func NewCallbackCDecl(fn interface{}) uintptr {
 //sys	TransmitFile(s Handle, handle Handle, bytesToWrite uint32, bytsPerSend uint32, overlapped *Overlapped, transmitFileBuf *TransmitFileBuffers, flags uint32) (err error) = mswsock.TransmitFile
 //sys	ReadDirectoryChanges(handle Handle, buf *byte, buflen uint32, watchSubTree bool, mask uint32, retlen *uint32, overlapped *Overlapped, completionRoutine uintptr) (err error) = kernel32.ReadDirectoryChangesW
 //sys	CertOpenSystemStore(hprov Handle, name *uint16) (store Handle, err error) = crypt32.CertOpenSystemStoreW
-//sys   CertOpenStore(storeProvider uintptr, msgAndCertEncodingType uint32, cryptProv uintptr, flags uint32, para uintptr) (handle Handle, err error) [failretval==InvalidHandle] = crypt32.CertOpenStore
+//sys   CertOpenStore(storeProvider uintptr, msgAndCertEncodingType uint32, cryptProv uintptr, flags uint32, para uintptr) (handle Handle, err error) = crypt32.CertOpenStore
 //sys	CertEnumCertificatesInStore(store Handle, prevContext *CertContext) (context *CertContext, err error) [failretval==nil] = crypt32.CertEnumCertificatesInStore
 //sys   CertAddCertificateContextToStore(store Handle, certContext *CertContext, addDisposition uint32, storeContext **CertContext) (err error) = crypt32.CertAddCertificateContextToStore
 //sys	CertCloseStore(store Handle, flags uint32) (err error) = crypt32.CertCloseStore
@@ -235,6 +285,9 @@ func NewCallbackCDecl(fn interface{}) uintptr {
 // This function returns 1 byte BOOLEAN rather than the 4 byte BOOL.
 //sys	CreateSymbolicLink(symlinkfilename *uint16, targetfilename *uint16, flags uint32) (err error) [failretval&0xff==0] = CreateSymbolicLinkW
 //sys	CreateHardLink(filename *uint16, existingfilename *uint16, reserved uintptr) (err error) [failretval&0xff==0] = CreateHardLinkW
+//sys	initializeProcThreadAttributeList(attrlist *_PROC_THREAD_ATTRIBUTE_LIST, attrcount uint32, flags uint32, size *uintptr) (err error) = InitializeProcThreadAttributeList
+//sys	deleteProcThreadAttributeList(attrlist *_PROC_THREAD_ATTRIBUTE_LIST) = DeleteProcThreadAttributeList
+//sys	updateProcThreadAttribute(attrlist *_PROC_THREAD_ATTRIBUTE_LIST, flags uint32, attr uintptr, value unsafe.Pointer, size uintptr, prevvalue unsafe.Pointer, returnedsize *uintptr) (err error) = UpdateProcThreadAttribute
 
 // syscall interface implementation for other packages
 
@@ -287,7 +340,31 @@ func Open(path string, mode int, perm uint32) (fd Handle, err error) {
 	default:
 		createmode = OPEN_EXISTING
 	}
-	h, e := CreateFile(pathp, access, sharemode, sa, createmode, FILE_ATTRIBUTE_NORMAL, 0)
+	var attrs uint32 = FILE_ATTRIBUTE_NORMAL
+	if perm&S_IWRITE == 0 {
+		attrs = FILE_ATTRIBUTE_READONLY
+		if createmode == CREATE_ALWAYS {
+			// We have been asked to create a read-only file.
+			// If the file already exists, the semantics of
+			// the Unix open system call is to preserve the
+			// existing permissions. If we pass CREATE_ALWAYS
+			// and FILE_ATTRIBUTE_READONLY to CreateFile,
+			// and the file already exists, CreateFile will
+			// change the file permissions.
+			// Avoid that to preserve the Unix semantics.
+			h, e := CreateFile(pathp, access, sharemode, sa, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+			switch e {
+			case ERROR_FILE_NOT_FOUND, _ERROR_BAD_NETPATH, ERROR_PATH_NOT_FOUND:
+				// File does not exist. These are the same
+				// errors as Errno.Is checks for ErrNotExist.
+				// Carry on to create the file.
+			default:
+				// Success or some different error.
+				return h, e
+			}
+		}
+	}
+	h, e := CreateFile(pathp, access, sharemode, sa, createmode, attrs, 0)
 	return h, e
 }
 
@@ -341,19 +418,22 @@ const ptrSize = unsafe.Sizeof(uintptr(0))
 // See https://msdn.microsoft.com/en-us/library/windows/desktop/aa365542(v=vs.85).aspx
 func setFilePointerEx(handle Handle, distToMove int64, newFilePointer *int64, whence uint32) error {
 	var e1 Errno
-	switch runtime.GOARCH {
-	default:
-		panic("unsupported architecture")
-	case "amd64":
+	if unsafe.Sizeof(uintptr(0)) == 8 {
 		_, _, e1 = Syscall6(procSetFilePointerEx.Addr(), 4, uintptr(handle), uintptr(distToMove), uintptr(unsafe.Pointer(newFilePointer)), uintptr(whence), 0, 0)
-	case "386":
-		// distToMove is a LARGE_INTEGER:
-		// https://msdn.microsoft.com/en-us/library/windows/desktop/aa383713(v=vs.85).aspx
-		_, _, e1 = Syscall6(procSetFilePointerEx.Addr(), 5, uintptr(handle), uintptr(distToMove), uintptr(distToMove>>32), uintptr(unsafe.Pointer(newFilePointer)), uintptr(whence), 0)
-	case "arm":
-		// distToMove must be 8-byte aligned per ARM calling convention
-		// https://msdn.microsoft.com/en-us/library/dn736986.aspx#Anchor_7
-		_, _, e1 = Syscall6(procSetFilePointerEx.Addr(), 6, uintptr(handle), 0, uintptr(distToMove), uintptr(distToMove>>32), uintptr(unsafe.Pointer(newFilePointer)), uintptr(whence))
+	} else {
+		// Different 32-bit systems disgaree about whether distToMove starts 8-byte aligned.
+		switch runtime.GOARCH {
+		default:
+			panic("unsupported 32-bit architecture")
+		case "386":
+			// distToMove is a LARGE_INTEGER:
+			// https://msdn.microsoft.com/en-us/library/windows/desktop/aa383713(v=vs.85).aspx
+			_, _, e1 = Syscall6(procSetFilePointerEx.Addr(), 5, uintptr(handle), uintptr(distToMove), uintptr(distToMove>>32), uintptr(unsafe.Pointer(newFilePointer)), uintptr(whence), 0)
+		case "arm":
+			// distToMove must be 8-byte aligned per ARM calling convention
+			// https://msdn.microsoft.com/en-us/library/dn736986.aspx#Anchor_7
+			_, _, e1 = Syscall6(procSetFilePointerEx.Addr(), 6, uintptr(handle), 0, uintptr(distToMove), uintptr(distToMove>>32), uintptr(unsafe.Pointer(newFilePointer)), uintptr(whence))
+		}
 	}
 	if e1 != 0 {
 		return errnoErr(e1)
@@ -544,9 +624,6 @@ func Fsync(fd Handle) (err error) {
 }
 
 func Chmod(path string, mode uint32) (err error) {
-	if mode == 0 {
-		return EINVAL
-	}
 	p, e := UTF16PtrFromString(path)
 	if e != nil {
 		return e
@@ -743,7 +820,7 @@ func (rsa *RawSockaddrAny) Sockaddr() (Sockaddr, error) {
 		for n < len(pp.Path) && pp.Path[n] != 0 {
 			n++
 		}
-		bytes := (*[10000]byte)(unsafe.Pointer(&pp.Path[0]))[0:n]
+		bytes := (*[len(pp.Path)]byte)(unsafe.Pointer(&pp.Path[0]))[0:n:n]
 		sa.Name = string(bytes)
 		return sa, nil
 
@@ -826,11 +903,19 @@ func Shutdown(fd Handle, how int) (err error) {
 }
 
 func WSASendto(s Handle, bufs *WSABuf, bufcnt uint32, sent *uint32, flags uint32, to Sockaddr, overlapped *Overlapped, croutine *byte) (err error) {
-	rsa, l, err := to.sockaddr()
+	rsa, len, err := to.sockaddr()
 	if err != nil {
 		return err
 	}
-	return WSASendTo(s, bufs, bufcnt, sent, flags, (*RawSockaddrAny)(unsafe.Pointer(rsa)), l, overlapped, croutine)
+	r1, _, e1 := Syscall9(procWSASendTo.Addr(), 9, uintptr(s), uintptr(unsafe.Pointer(bufs)), uintptr(bufcnt), uintptr(unsafe.Pointer(sent)), uintptr(flags), uintptr(unsafe.Pointer(rsa)), uintptr(len), uintptr(unsafe.Pointer(overlapped)), uintptr(unsafe.Pointer(croutine)))
+	if r1 == socket_error {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		} else {
+			err = EINVAL
+		}
+	}
+	return err
 }
 
 func LoadGetAddrInfo() error {
@@ -1068,7 +1153,7 @@ func (s Signal) String() string {
 			return str
 		}
 	}
-	return "signal " + itoa(int(s))
+	return "signal " + itoa.Itoa(int(s))
 }
 
 func LoadCreateSymbolicLink() error {
@@ -1130,4 +1215,53 @@ func Readlink(path string, buf []byte) (n int, err error) {
 	n = copy(buf, []byte(s))
 
 	return n, nil
+}
+
+// Deprecated: CreateIoCompletionPort has the wrong function signature. Use x/sys/windows.CreateIoCompletionPort.
+func CreateIoCompletionPort(filehandle Handle, cphandle Handle, key uint32, threadcnt uint32) (Handle, error) {
+	return createIoCompletionPort(filehandle, cphandle, uintptr(key), threadcnt)
+}
+
+// Deprecated: GetQueuedCompletionStatus has the wrong function signature. Use x/sys/windows.GetQueuedCompletionStatus.
+func GetQueuedCompletionStatus(cphandle Handle, qty *uint32, key *uint32, overlapped **Overlapped, timeout uint32) error {
+	var ukey uintptr
+	var pukey *uintptr
+	if key != nil {
+		ukey = uintptr(*key)
+		pukey = &ukey
+	}
+	err := getQueuedCompletionStatus(cphandle, qty, pukey, overlapped, timeout)
+	if key != nil {
+		*key = uint32(ukey)
+		if uintptr(*key) != ukey && err == nil {
+			err = errorspkg.New("GetQueuedCompletionStatus returned key overflow")
+		}
+	}
+	return err
+}
+
+// Deprecated: PostQueuedCompletionStatus has the wrong function signature. Use x/sys/windows.PostQueuedCompletionStatus.
+func PostQueuedCompletionStatus(cphandle Handle, qty uint32, key uint32, overlapped *Overlapped) error {
+	return postQueuedCompletionStatus(cphandle, qty, uintptr(key), overlapped)
+}
+
+// newProcThreadAttributeList allocates new PROC_THREAD_ATTRIBUTE_LIST, with
+// the requested maximum number of attributes, which must be cleaned up by
+// deleteProcThreadAttributeList.
+func newProcThreadAttributeList(maxAttrCount uint32) (*_PROC_THREAD_ATTRIBUTE_LIST, error) {
+	var size uintptr
+	err := initializeProcThreadAttributeList(nil, maxAttrCount, 0, &size)
+	if err != ERROR_INSUFFICIENT_BUFFER {
+		if err == nil {
+			return nil, errorspkg.New("unable to query buffer size from InitializeProcThreadAttributeList")
+		}
+		return nil, err
+	}
+	// size is guaranteed to be ≥1 by initializeProcThreadAttributeList.
+	al := (*_PROC_THREAD_ATTRIBUTE_LIST)(unsafe.Pointer(&make([]byte, size)[0]))
+	err = initializeProcThreadAttributeList(al, maxAttrCount, 0, &size)
+	if err != nil {
+		return nil, err
+	}
+	return al, nil
 }

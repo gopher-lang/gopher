@@ -6,7 +6,6 @@ package runtime
 
 import (
 	"runtime/internal/atomic"
-	"runtime/internal/sys"
 	"unsafe"
 )
 
@@ -14,57 +13,8 @@ type mOS struct {
 	waitsemacount uint32
 }
 
-//go:noescape
-func setitimer(mode int32, new, old *itimerval)
-
-//go:noescape
-func sigaction(sig uint32, new, old *sigactiont)
-
-//go:noescape
-func sigaltstack(new, old *stackt)
-
-//go:noescape
-func obsdsigprocmask(how int32, new sigset) sigset
-
-//go:nosplit
-//go:nowritebarrierrec
-func sigprocmask(how int32, new, old *sigset) {
-	n := sigset(0)
-	if new != nil {
-		n = *new
-	}
-	r := obsdsigprocmask(how, n)
-	if old != nil {
-		*old = r
-	}
-}
-
-//go:noescape
-func sysctl(mib *uint32, miblen uint32, out *byte, size *uintptr, dst *byte, ndst uintptr) int32
-
-func raise(sig uint32)
-func raiseproc(sig uint32)
-
-//go:noescape
-func tfork(param *tforkt, psize uintptr, mm *m, gg *g, fn uintptr) int32
-
-//go:noescape
-func thrsleep(ident uintptr, clock_id int32, tsp *timespec, lock uintptr, abort *uint32) int32
-
-//go:noescape
-func thrwakeup(ident uintptr, n int32) int32
-
-func osyield()
-
-func kqueue() int32
-
-//go:noescape
-func kevent(kq int32, ch *keventt, nch int32, ev *keventt, nev int32, ts *timespec) int32
-func closeonexec(fd int32)
-
 const (
 	_ESRCH       = 3
-	_EAGAIN      = 35
 	_EWOULDBLOCK = _EAGAIN
 	_ENOTSUP     = 91
 
@@ -84,9 +34,10 @@ const (
 	_CTL_KERN   = 1
 	_KERN_OSREV = 3
 
-	_CTL_HW      = 6
-	_HW_NCPU     = 3
-	_HW_PAGESIZE = 7
+	_CTL_HW        = 6
+	_HW_NCPU       = 3
+	_HW_PAGESIZE   = 7
+	_HW_NCPUONLINE = 25
 )
 
 func sysctlInt(mib []uint32) (int32, bool) {
@@ -100,9 +51,14 @@ func sysctlInt(mib []uint32) (int32, bool) {
 }
 
 func getncpu() int32 {
-	// Fetch hw.ncpu via sysctl.
-	if ncpu, ok := sysctlInt([]uint32{_CTL_HW, _HW_NCPU}); ok {
-		return int32(ncpu)
+	// Try hw.ncpuonline first because hw.ncpu would report a number twice as
+	// high as the actual CPUs running on OpenBSD 6.4 with hyperthreading
+	// disabled (hw.smt=0). See https://golang.org/issue/30127
+	if n, ok := sysctlInt([]uint32{_CTL_HW, _HW_NCPUONLINE}); ok {
+		return int32(n)
+	}
+	if n, ok := sysctlInt([]uint32{_CTL_HW, _HW_NCPU}); ok {
+		return int32(n)
 	}
 	return 1
 }
@@ -133,10 +89,7 @@ func semasleep(ns int64) int32 {
 	var tsp *timespec
 	if ns >= 0 {
 		var ts timespec
-		var nsec int32
-		ns += nanotime()
-		ts.set_sec(int64(timediv(ns, 1000000000, &nsec)))
-		ts.set_nsec(nsec)
+		ts.setNsec(ns + nanotime())
 		tsp = &ts
 	}
 
@@ -175,36 +128,6 @@ func semawakeup(mp *m) {
 	}
 }
 
-// May run with m.p==nil, so write barriers are not allowed.
-//go:nowritebarrier
-func newosproc(mp *m) {
-	stk := unsafe.Pointer(mp.g0.stack.hi)
-	if false {
-		print("newosproc stk=", stk, " m=", mp, " g=", mp.g0, " id=", mp.id, " ostk=", &mp, "\n")
-	}
-
-	// Stack pointer must point inside stack area (as marked with MAP_STACK),
-	// rather than at the top of it.
-	param := tforkt{
-		tf_tcb:   unsafe.Pointer(&mp.tls[0]),
-		tf_tid:   (*int32)(unsafe.Pointer(&mp.procid)),
-		tf_stack: uintptr(stk) - sys.PtrSize,
-	}
-
-	var oset sigset
-	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
-	ret := tfork(&param, unsafe.Sizeof(param), mp, mp.g0, funcPC(mstart))
-	sigprocmask(_SIG_SETMASK, &oset, nil)
-
-	if ret < 0 {
-		print("runtime: failed to create new OS thread (have ", mcount()-1, " already; errno=", -ret, ")\n")
-		if ret == -_EAGAIN {
-			println("runtime: may need to increase max user processes (ulimit -p)")
-		}
-		throw("runtime.newosproc")
-	}
-}
-
 func osinit() {
 	ncpu = getncpu()
 	physPageSize = getPageSize()
@@ -228,17 +151,18 @@ func goenvs() {
 // Called to initialize a new m (including the bootstrap m).
 // Called on the parent thread (main thread in case of bootstrap), can allocate memory.
 func mpreinit(mp *m) {
-	mp.gsignal = malg(32 * 1024)
+	gsignalSize := int32(32 * 1024)
+	if GOARCH == "mips64" {
+		gsignalSize = int32(64 * 1024)
+	}
+	mp.gsignal = malg(gsignalSize)
 	mp.gsignal.m = mp
 }
 
 // Called to initialize a new m (including the bootstrap m).
 // Called on the new thread, can not allocate memory.
 func minit() {
-	// m.procid is a uint64, but tfork writes an int32. Fix it up.
-	_g_ := getg()
-	_g_.m.procid = uint64(*(*int32)(unsafe.Pointer(&_g_.m.procid)))
-
+	getg().m.procid = uint64(getthrid())
 	minitSignals()
 }
 
@@ -246,6 +170,11 @@ func minit() {
 //go:nosplit
 func unminit() {
 	unminitSignals()
+}
+
+// Called from exitm, but not from drop, to undo the effect of thread-owned
+// resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+func mdestroy(mp *m) {
 }
 
 func sigtramp()
@@ -299,6 +228,7 @@ func sigdelset(mask *sigset, i int) {
 	*mask &^= 1 << (uint32(i) - 1)
 }
 
+//go:nosplit
 func (c *sigctxt) fixsigcode(sig uint32) {
 }
 
@@ -332,4 +262,13 @@ func osStackRemap(s *mspan, flags int32) {
 		print("runtime: remapping stack memory ", hex(s.base()), " ", s.npages*pageSize, " a=", a, " err=", err, "\n")
 		throw("remapping stack memory failed")
 	}
+}
+
+//go:nosplit
+func raise(sig uint32) {
+	thrkill(getthrid(), int(sig))
+}
+
+func signalM(mp *m, sig int) {
+	thrkill(int32(mp.procid), sig)
 }

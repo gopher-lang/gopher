@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build (freebsd && 386) || (freebsd && arm)
 // +build freebsd,386 freebsd,arm
 
 package syscall
@@ -22,7 +23,7 @@ func (any *anyMessage) parseInterfaceMessage(b []byte) *InterfaceMessage {
 	// FreeBSD 10 and beyond have a restructured mbuf
 	// packet header view.
 	// See https://svnweb.freebsd.org/base?view=revision&revision=254804.
-	if freebsdVersion >= 1000000 {
+	if supportsABI(1000000) {
 		m := (*ifMsghdr)(unsafe.Pointer(any))
 		p.Header.Data.Hwassist = uint32(m.Data.Hwassist)
 		p.Header.Data.Epoch = m.Data.Epoch

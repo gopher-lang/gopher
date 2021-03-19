@@ -14,10 +14,8 @@ func (fd *FD) Fsync() error {
 		return err
 	}
 	defer fd.decref()
-
-	_, _, e1 := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd.Sysfd), syscall.F_FULLFSYNC, 0)
-	if e1 != 0 {
-		return e1
-	}
-	return nil
+	return ignoringEINTR(func() error {
+		_, err := fcntl(fd.Sysfd, syscall.F_FULLFSYNC, 0)
+		return err
+	})
 }

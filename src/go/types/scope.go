@@ -15,9 +15,6 @@ import (
 	"strings"
 )
 
-// TODO(gri) Provide scopes with a name or other mechanism so that
-//           objects can use that information for better printing.
-
 // A Scope maintains a set of objects and links to its containing
 // (parent) and contained (children) scopes. Objects may be inserted
 // and looked up by name. The zero value for Scope is a ready-to-use
@@ -45,7 +42,7 @@ func NewScope(parent *Scope, pos, end token.Pos, comment string) *Scope {
 // Parent returns the scope's containing (parent) scope.
 func (s *Scope) Parent() *Scope { return s.parent }
 
-// Len() returns the number of scope elements.
+// Len returns the number of scope elements.
 func (s *Scope) Len() int { return len(s.elems) }
 
 // Names returns the scope's element names in sorted order.
@@ -60,7 +57,7 @@ func (s *Scope) Names() []string {
 	return names
 }
 
-// NumChildren() returns the number of scopes nested in s.
+// NumChildren returns the number of scopes nested in s.
 func (s *Scope) NumChildren() int { return len(s.children) }
 
 // Child returns the i'th child scope for 0 <= i < NumChildren().
@@ -80,7 +77,7 @@ func (s *Scope) Lookup(name string) Object {
 //
 // Note that obj.Parent() may be different from the returned scope if the
 // object was inserted into the scope and already had a parent at that
-// time (see Insert, below). This can only happen for dot-imported objects
+// time (see Insert). This can only happen for dot-imported objects
 // whose scope is the scope of the package that exported them.
 func (s *Scope) LookupParent(name string, pos token.Pos) (*Scope, Object) {
 	for ; s != nil; s = s.parent {
@@ -111,6 +108,40 @@ func (s *Scope) Insert(obj Object) Object {
 	return nil
 }
 
+// squash merges s with its parent scope p by adding all
+// objects of s to p, adding all children of s to the
+// children of p, and removing s from p's children.
+// The function f is called for each object obj in s which
+// has an object alt in p. s should be discarded after
+// having been squashed.
+func (s *Scope) squash(err func(obj, alt Object)) {
+	p := s.parent
+	assert(p != nil)
+	for _, obj := range s.elems {
+		obj.setParent(nil)
+		if alt := p.Insert(obj); alt != nil {
+			err(obj, alt)
+		}
+	}
+
+	j := -1 // index of s in p.children
+	for i, ch := range p.children {
+		if ch == s {
+			j = i
+			break
+		}
+	}
+	assert(j >= 0)
+	k := len(p.children) - 1
+	p.children[j] = p.children[k]
+	p.children = p.children[:k]
+
+	p.children = append(p.children, s.children...)
+
+	s.children = nil
+	s.elems = nil
+}
+
 // Pos and End describe the scope's source code extent [pos, end).
 // The results are guaranteed to be valid only if the type-checked
 // AST has complete position information. The extent is undefined
@@ -118,7 +149,7 @@ func (s *Scope) Insert(obj Object) Object {
 func (s *Scope) Pos() token.Pos { return s.pos }
 func (s *Scope) End() token.Pos { return s.end }
 
-// Contains returns true if pos is within the scope's extent.
+// Contains reports whether pos is within the scope's extent.
 // The result is guaranteed to be valid only if the type-checked
 // AST has complete position information.
 func (s *Scope) Contains(pos token.Pos) bool {

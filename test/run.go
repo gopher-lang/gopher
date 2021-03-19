@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"os"
@@ -34,6 +35,7 @@ var (
 	keep           = flag.Bool("k", false, "keep. keep temporary directory.")
 	numParallel    = flag.Int("n", runtime.NumCPU(), "number of parallel tests to run")
 	summary        = flag.Bool("summary", false, "show summary of results")
+	allCodegen     = flag.Bool("all_codegen", defaultAllCodeGen(), "run all goos/goarch for codegen")
 	showSkips      = flag.Bool("show_skips", false, "show skipped tests")
 	runSkips       = flag.Bool("run_skips", false, "run skipped tests (ignore skip and build tags)")
 	linkshared     = flag.Bool("linkshared", false, "")
@@ -44,12 +46,20 @@ var (
 	shards = flag.Int("shards", 0, "number of shards. If 0, all tests are run. This is used by the continuous build.")
 )
 
+// defaultAllCodeGen returns the default value of the -all_codegen
+// flag. By default, we prefer to be fast (returning false), except on
+// the linux-amd64 builder that's already very fast, so we get more
+// test coverage on trybots. See https://golang.org/issue/34297.
+func defaultAllCodeGen() bool {
+	return os.Getenv("GO_BUILDER_NAME") == "linux-amd64"
+}
+
 var (
 	goos, goarch string
 
 	// dirs are the directories to look for *.go files in.
 	// TODO(bradfitz): just use all directories?
-	dirs = []string{".", "ken", "chan", "interface", "syntax", "dwarf", "fixedbugs", "codegen"}
+	dirs = []string{".", "ken", "chan", "interface", "syntax", "dwarf", "fixedbugs", "codegen", "runtime", "abi", "typeparam"}
 
 	// ratec controls the max number of tests running at a time.
 	ratec chan bool
@@ -78,6 +88,7 @@ func main() {
 	// Disable parallelism if printing or if using a simulator.
 	if *verbose || len(findExecCmd()) > 0 {
 		*numParallel = 1
+		*runoutputLimit = 1
 	}
 
 	ratec = make(chan bool, *numParallel)
@@ -156,14 +167,6 @@ func main() {
 	}
 }
 
-func toolPath(name string) string {
-	p := filepath.Join(os.Getenv("GOROOT"), "bin", "tool", name)
-	if _, err := os.Stat(p); err != nil {
-		log.Fatalf("didn't find binary at %s", p)
-	}
-	return p
-}
-
 // goTool reports the path of the go tool to use to run the tests.
 // If possible, use the same Go used to run run.go, otherwise
 // fallback to the go version found in the PATH.
@@ -191,9 +194,14 @@ func shardMatch(name string) bool {
 
 func goFiles(dir string) []string {
 	f, err := os.Open(dir)
-	check(err)
+	if err != nil {
+		log.Fatal(err)
+	}
 	dirnames, err := f.Readdirnames(-1)
-	check(err)
+	f.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
 	names := []string{}
 	for _, name := range dirnames {
 		if !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go") && shardMatch(name) {
@@ -232,11 +240,14 @@ func compileInDir(runcmd runCmd, dir string, flags []string, localImports bool, 
 	return runcmd(cmd...)
 }
 
-func linkFile(runcmd runCmd, goname string) (err error) {
+func linkFile(runcmd runCmd, goname string, ldflags []string) (err error) {
 	pfile := strings.Replace(goname, ".go", ".o", -1)
 	cmd := []string{goTool(), "tool", "link", "-w", "-o", "a.exe", "-L", "."}
 	if *linkshared {
 		cmd = append(cmd, "-linkshared", "-installsuffix=dynlink")
+	}
+	if ldflags != nil {
+		cmd = append(cmd, ldflags...)
 	}
 	cmd = append(cmd, pfile)
 	_, err = runcmd(cmd...)
@@ -247,12 +258,6 @@ func linkFile(runcmd runCmd, goname string) (err error) {
 type skipError string
 
 func (s skipError) Error() string { return string(s) }
-
-func check(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
-}
 
 // test holds the state of a test.
 type test struct {
@@ -321,7 +326,19 @@ func goDirFiles(longdir string) (filter []os.FileInfo, err error) {
 	return
 }
 
-var packageRE = regexp.MustCompile(`(?m)^package (\w+)`)
+var packageRE = regexp.MustCompile(`(?m)^package ([\p{Lu}\p{Ll}\w]+)`)
+
+func getPackageNameFromSource(fn string) (string, error) {
+	data, err := ioutil.ReadFile(fn)
+	if err != nil {
+		return "", err
+	}
+	pkgname := packageRE.FindStringSubmatch(string(data))
+	if pkgname == nil {
+		return "", fmt.Errorf("cannot find package name in %s", fn)
+	}
+	return pkgname[1], nil
+}
 
 // If singlefilepkgs is set, each file is considered a separate package
 // even if the package names are the same.
@@ -334,19 +351,15 @@ func goDirPackages(longdir string, singlefilepkgs bool) ([][]string, error) {
 	m := make(map[string]int)
 	for _, file := range files {
 		name := file.Name()
-		data, err := ioutil.ReadFile(filepath.Join(longdir, name))
+		pkgname, err := getPackageNameFromSource(filepath.Join(longdir, name))
 		if err != nil {
-			return nil, err
+			log.Fatal(err)
 		}
-		pkgname := packageRE.FindStringSubmatch(string(data))
-		if pkgname == nil {
-			return nil, fmt.Errorf("cannot find package name in %s", name)
-		}
-		i, ok := m[pkgname[1]]
+		i, ok := m[pkgname]
 		if singlefilepkgs || !ok {
 			i = len(pkgs)
 			pkgs = append(pkgs, nil)
-			m[pkgname[1]] = i
+			m[pkgname] = i
 		}
 		pkgs[i] = append(pkgs[i], name)
 	}
@@ -354,8 +367,9 @@ func goDirPackages(longdir string, singlefilepkgs bool) ([][]string, error) {
 }
 
 type context struct {
-	GOOS   string
-	GOARCH string
+	GOOS     string
+	GOARCH   string
+	noOptEnv bool
 }
 
 // shouldTest looks for build tags in a source file and returns
@@ -375,10 +389,13 @@ func shouldTest(src string, goos, goarch string) (ok bool, whyNot string) {
 		if len(line) == 0 || line[0] != '+' {
 			continue
 		}
+		gcFlags := os.Getenv("GO_GCFLAGS")
 		ctxt := &context{
-			GOOS:   goos,
-			GOARCH: goarch,
+			GOOS:     goos,
+			GOARCH:   goarch,
+			noOptEnv: strings.Contains(gcFlags, "-N") || strings.Contains(gcFlags, "-l"),
 		}
+
 		words := strings.Fields(line)
 		if words[0] == "+build" {
 			ok := false
@@ -421,7 +438,11 @@ func (ctxt *context) match(name string) bool {
 		}
 	}
 
-	if name == ctxt.GOOS || name == ctxt.GOARCH {
+	if name == ctxt.GOOS || name == ctxt.GOARCH || name == "gc" {
+		return true
+	}
+
+	if ctxt.noOptEnv && name == "gcflags_noopt" {
 		return true
 	}
 
@@ -439,8 +460,14 @@ func init() { checkShouldTest() }
 // or else the commands will rebuild any needed packages (like runtime)
 // over and over.
 func goGcflags() string {
-	return "-gcflags=" + os.Getenv("GO_GCFLAGS")
+	return "-gcflags=all=" + os.Getenv("GO_GCFLAGS")
 }
+
+func goGcflagsIsEmpty() bool {
+	return "" == os.Getenv("GO_GCFLAGS")
+}
+
+var errTimeout = errors.New("command exceeded time limit")
 
 // run runs a test.
 func (t *test) run() {
@@ -464,7 +491,7 @@ func (t *test) run() {
 	// Execution recipe stops at first blank line.
 	pos := strings.Index(t.src, "\n\n")
 	if pos == -1 {
-		t.err = errors.New("double newline not found")
+		t.err = fmt.Errorf("double newline ending execution recipe not found in %s", t.goFileName())
 		return
 	}
 	action := t.src[:pos]
@@ -472,9 +499,7 @@ func (t *test) run() {
 		// skip first line
 		action = action[nl+1:]
 	}
-	if strings.HasPrefix(action, "//") {
-		action = action[2:]
-	}
+	action = strings.TrimPrefix(action, "//")
 
 	// Check for build constraints only up to the actual code.
 	pkgPos := strings.Index(t.src, "\npackage")
@@ -488,11 +513,12 @@ func (t *test) run() {
 		return
 	}
 
-	var args, flags []string
+	var args, flags, runenv []string
 	var tim int
 	wantError := false
 	wantAuto := false
 	singlefilepkgs := false
+	setpkgpaths := false
 	localImports := true
 	f := strings.Fields(action)
 	if len(f) > 0 {
@@ -502,7 +528,7 @@ func (t *test) run() {
 
 	// TODO: Clean up/simplify this switch statement.
 	switch action {
-	case "compile", "compiledir", "build", "builddir", "buildrundir", "run", "buildrun", "runoutput", "rundir", "asmcheck":
+	case "compile", "compiledir", "build", "builddir", "buildrundir", "run", "buildrun", "runoutput", "rundir", "runindir", "asmcheck":
 		// nothing to do
 	case "errorcheckandrundir":
 		wantError = false // should be no error if also will run
@@ -531,6 +557,8 @@ func (t *test) run() {
 			wantError = false
 		case "-s":
 			singlefilepkgs = true
+		case "-P":
+			setpkgpaths = true
 		case "-n":
 			// Do not set relative path for local imports to current dir,
 			// e.g. do not pass -D . -I . to the compiler.
@@ -544,11 +572,27 @@ func (t *test) run() {
 			if err != nil {
 				t.err = fmt.Errorf("need number of seconds for -t timeout, got %s instead", args[0])
 			}
+		case "-goexperiment": // set GOEXPERIMENT environment
+			args = args[1:]
+			runenv = append(runenv, "GOEXPERIMENT="+args[0])
 
 		default:
 			flags = append(flags, args[0])
 		}
 		args = args[1:]
+	}
+	if action == "errorcheck" {
+		found := false
+		for i, f := range flags {
+			if strings.HasPrefix(f, "-d=") {
+				flags[i] = f + ",ssa/check/on"
+				found = true
+				break
+			}
+		}
+		if !found {
+			flags = append(flags, "-d=ssa/check/on")
+		}
 	}
 
 	t.makeTempDir()
@@ -557,7 +601,9 @@ func (t *test) run() {
 	}
 
 	err = ioutil.WriteFile(filepath.Join(t.tempDir, t.gofile), srcBytes, 0644)
-	check(err)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// A few tests (of things like the environment) require these to be set.
 	if os.Getenv("GOOS") == "" {
@@ -567,18 +613,25 @@ func (t *test) run() {
 		os.Setenv("GOARCH", runtime.GOARCH)
 	}
 
-	useTmp := true
+	var (
+		runInDir        = t.tempDir
+		tempDirIsGOPATH = false
+	)
 	runcmd := func(args ...string) ([]byte, error) {
 		cmd := exec.Command(args[0], args[1:]...)
 		var buf bytes.Buffer
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
-		if useTmp {
-			cmd.Dir = t.tempDir
-			cmd.Env = envForDir(cmd.Dir)
-		} else {
-			cmd.Env = os.Environ()
+		cmd.Env = append(os.Environ(), "GOENV=off", "GOFLAGS=")
+		if runInDir != "" {
+			cmd.Dir = runInDir
+			// Set PWD to match Dir to speed up os.Getwd in the child process.
+			cmd.Env = append(cmd.Env, "PWD="+cmd.Dir)
 		}
+		if tempDirIsGOPATH {
+			cmd.Env = append(cmd.Env, "GOPATH="+t.tempDir)
+		}
+		cmd.Env = append(cmd.Env, runenv...)
 
 		var err error
 
@@ -595,16 +648,18 @@ func (t *test) run() {
 				case err = <-done:
 					// ok
 				case <-tick.C:
+					cmd.Process.Signal(os.Interrupt)
+					time.Sleep(1 * time.Second)
 					cmd.Process.Kill()
-					err = <-done
-					// err = errors.New("Test timeout")
+					<-done
+					err = errTimeout
 				}
 				tick.Stop()
 			}
 		} else {
 			err = cmd.Run()
 		}
-		if err != nil {
+		if err != nil && err != errTimeout {
 			err = fmt.Errorf("%s\n%s", err, buf.Bytes())
 		}
 		return buf.Bytes(), err
@@ -619,12 +674,40 @@ func (t *test) run() {
 		// Compile Go file and match the generated assembly
 		// against a set of regexps in comments.
 		ops := t.wantedAsmOpcodes(long)
+		self := runtime.GOOS + "/" + runtime.GOARCH
 		for _, env := range ops.Envs() {
-			cmdline := []string{"build", "-gcflags", "-S"}
-			cmdline = append(cmdline, flags...)
+			// Only run checks relevant to the current GOOS/GOARCH,
+			// to avoid triggering a cross-compile of the runtime.
+			if string(env) != self && !strings.HasPrefix(string(env), self+"/") && !*allCodegen {
+				continue
+			}
+			// -S=2 forces outermost line numbers when disassembling inlined code.
+			cmdline := []string{"build", "-gcflags", "-S=2"}
+
+			// Append flags, but don't override -gcflags=-S=2; add to it instead.
+			for i := 0; i < len(flags); i++ {
+				flag := flags[i]
+				switch {
+				case strings.HasPrefix(flag, "-gcflags="):
+					cmdline[2] += " " + strings.TrimPrefix(flag, "-gcflags=")
+				case strings.HasPrefix(flag, "--gcflags="):
+					cmdline[2] += " " + strings.TrimPrefix(flag, "--gcflags=")
+				case flag == "-gcflags", flag == "--gcflags":
+					i++
+					if i < len(flags) {
+						cmdline[2] += " " + flags[i]
+					}
+				default:
+					cmdline = append(cmdline, flag)
+				}
+			}
+
 			cmdline = append(cmdline, long)
 			cmd := exec.Command(goTool(), cmdline...)
 			cmd.Env = append(os.Environ(), env.Environ()...)
+			if len(flags) > 0 && flags[0] == "-race" {
+				cmd.Env = append(cmd.Env, "CGO_ENABLED=1")
+			}
 
 			var buf bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &buf, &buf
@@ -646,11 +729,75 @@ func (t *test) run() {
 		// Fail if wantError is true and compilation was successful and vice versa.
 		// Match errors produced by gc against errors in comments.
 		// TODO(gri) remove need for -C (disable printing of columns in error messages)
-		cmdline := []string{goTool(), "tool", "compile", "-C", "-e", "-o", "a.o"}
+		cmdline := []string{goTool(), "tool", "compile", "-d=panic", "-C", "-e", "-o", "a.o"}
 		// No need to add -dynlink even if linkshared if we're just checking for errors...
 		cmdline = append(cmdline, flags...)
 		cmdline = append(cmdline, long)
 		out, err := runcmd(cmdline...)
+		if wantError {
+			if err == nil {
+				t.err = fmt.Errorf("compilation succeeded unexpectedly\n%s", out)
+				return
+			}
+			if err == errTimeout {
+				t.err = fmt.Errorf("compilation timed out")
+				return
+			}
+		} else {
+			if err != nil {
+				t.err = err
+				return
+			}
+		}
+		if *updateErrors {
+			t.updateErrors(string(out), long)
+		}
+		t.err = t.errorCheck(string(out), wantAuto, long, t.gofile)
+		if t.err != nil {
+			return // don't hide error if run below succeeds
+		}
+
+		// The following is temporary scaffolding to get types2 typechecker
+		// up and running against the existing test cases. The explicitly
+		// listed files don't pass yet, usually because the error messages
+		// are slightly different (this list is not complete). Any errorcheck
+		// tests that require output from analysis phases past initial type-
+		// checking are also excluded since these phases are not running yet.
+		// We can get rid of this code once types2 is fully plugged in.
+
+		// For now we're done when we can't handle the file or some of the flags.
+		// The first goal is to eliminate the excluded list; the second goal is to
+		// eliminate the flag list.
+
+		// Excluded files.
+		filename := strings.Replace(t.goFileName(), "\\", "/", -1) // goFileName() uses \ on Windows
+		if excluded[filename] {
+			if *verbose {
+				fmt.Printf("excl\t%s\n", filename)
+			}
+			return // cannot handle file yet
+		}
+
+		// Excluded flags.
+		for _, flag := range flags {
+			for _, pattern := range []string{
+				"-m",
+			} {
+				if strings.Contains(flag, pattern) {
+					if *verbose {
+						fmt.Printf("excl\t%s\t%s\n", filename, flags)
+					}
+					return // cannot handle flag
+				}
+			}
+		}
+
+		// Run errorcheck again with -G option (new typechecker).
+		cmdline = []string{goTool(), "tool", "compile", "-G=3", "-C", "-e", "-o", "a.o"}
+		// No need to add -dynlink even if linkshared if we're just checking for errors...
+		cmdline = append(cmdline, flags...)
+		cmdline = append(cmdline, long)
+		out, err = runcmd(cmdline...)
 		if wantError {
 			if err == nil {
 				t.err = fmt.Errorf("compilation succeeded unexpectedly\n%s", out)
@@ -666,7 +813,6 @@ func (t *test) run() {
 			t.updateErrors(string(out), long)
 		}
 		t.err = t.errorCheck(string(out), wantAuto, long, t.gofile)
-		return
 
 	case "compile":
 		// Compile Go file.
@@ -688,6 +834,7 @@ func (t *test) run() {
 		}
 
 	case "errorcheckdir", "errorcheckandrundir":
+		flags = append(flags, "-d=panic")
 		// Compile and errorCheck all files in the directory as packages in lexicographic order.
 		// If errorcheckdir and wantError, compilation of the last package must fail.
 		// If errorcheckandrundir and wantError, compilation of the package prior the last must fail.
@@ -742,8 +889,28 @@ func (t *test) run() {
 			t.err = err
 			return
 		}
+		// Split flags into gcflags and ldflags
+		ldflags := []string{}
+		for i, fl := range flags {
+			if fl == "-ldflags" {
+				ldflags = flags[i+1:]
+				flags = flags[0:i]
+				break
+			}
+		}
+
 		for i, gofiles := range pkgs {
-			_, err := compileInDir(runcmd, longdir, flags, localImports, gofiles...)
+			pflags := []string{}
+			pflags = append(pflags, flags...)
+			if setpkgpaths {
+				fp := filepath.Join(longdir, gofiles[0])
+				pkgname, err := getPackageNameFromSource(fp)
+				if err != nil {
+					log.Fatal(err)
+				}
+				pflags = append(pflags, "-p", pkgname)
+			}
+			_, err := compileInDir(runcmd, longdir, pflags, localImports, gofiles...)
 			// Allow this package compilation fail based on conditions below;
 			// its errors were checked in previous case.
 			if err != nil && !(wantError && action == "errorcheckandrundir" && i == len(pkgs)-2) {
@@ -751,7 +918,7 @@ func (t *test) run() {
 				return
 			}
 			if i == len(pkgs)-1 {
-				err = linkFile(runcmd, gofiles[0])
+				err = linkFile(runcmd, gofiles[0], ldflags)
 				if err != nil {
 					t.err = err
 					return
@@ -765,11 +932,48 @@ func (t *test) run() {
 					t.err = err
 					return
 				}
-				if strings.Replace(string(out), "\r\n", "\n", -1) != t.expectedOutput() {
-					t.err = fmt.Errorf("incorrect output\n%s", out)
-				}
+				t.checkExpectedOutput(out)
 			}
 		}
+
+	case "runindir":
+		// Make a shallow copy of t.goDirName() in its own module and GOPATH, and
+		// run "go run ." in it. The module path (and hence import path prefix) of
+		// the copy is equal to the basename of the source directory.
+		//
+		// It's used when test a requires a full 'go build' in order to compile
+		// the sources, such as when importing multiple packages (issue29612.dir)
+		// or compiling a package containing assembly files (see issue15609.dir),
+		// but still needs to be run to verify the expected output.
+		tempDirIsGOPATH = true
+		srcDir := t.goDirName()
+		modName := filepath.Base(srcDir)
+		gopathSrcDir := filepath.Join(t.tempDir, "src", modName)
+		runInDir = gopathSrcDir
+
+		if err := overlayDir(gopathSrcDir, srcDir); err != nil {
+			t.err = err
+			return
+		}
+
+		modFile := fmt.Sprintf("module %s\ngo 1.14\n", modName)
+		if err := ioutil.WriteFile(filepath.Join(gopathSrcDir, "go.mod"), []byte(modFile), 0666); err != nil {
+			t.err = err
+			return
+		}
+
+		cmd := []string{goTool(), "run", goGcflags()}
+		if *linkshared {
+			cmd = append(cmd, "-linkshared")
+		}
+		cmd = append(cmd, flags...)
+		cmd = append(cmd, ".")
+		out, err := runcmd(cmd...)
+		if err != nil {
+			t.err = err
+			return
+		}
+		t.checkExpectedOutput(out)
 
 	case "build":
 		// Build Go file.
@@ -787,25 +991,37 @@ func (t *test) run() {
 			t.err = dirErr
 			break
 		}
-		var gos []os.FileInfo
-		var asms []os.FileInfo
+		var gos []string
+		var asms []string
 		for _, file := range files {
 			switch filepath.Ext(file.Name()) {
 			case ".go":
-				gos = append(gos, file)
+				gos = append(gos, filepath.Join(longdir, file.Name()))
 			case ".s":
-				asms = append(asms, file)
+				asms = append(asms, filepath.Join(longdir, file.Name()))
 			}
 
+		}
+		if len(asms) > 0 {
+			emptyHdrFile := filepath.Join(t.tempDir, "go_asm.h")
+			if err := ioutil.WriteFile(emptyHdrFile, nil, 0666); err != nil {
+				t.err = fmt.Errorf("write empty go_asm.h: %s", err)
+				return
+			}
+			cmd := []string{goTool(), "tool", "asm", "-gensymabis", "-o", "symabis"}
+			cmd = append(cmd, asms...)
+			_, err = runcmd(cmd...)
+			if err != nil {
+				t.err = err
+				break
+			}
 		}
 		var objs []string
 		cmd := []string{goTool(), "tool", "compile", "-e", "-D", ".", "-I", ".", "-o", "go.o"}
 		if len(asms) > 0 {
-			cmd = append(cmd, "-asmhdr", "go_asm.h")
+			cmd = append(cmd, "-asmhdr", "go_asm.h", "-symabis", "symabis")
 		}
-		for _, file := range gos {
-			cmd = append(cmd, filepath.Join(longdir, file.Name()))
-		}
+		cmd = append(cmd, gos...)
 		_, err := runcmd(cmd...)
 		if err != nil {
 			t.err = err
@@ -814,9 +1030,7 @@ func (t *test) run() {
 		objs = append(objs, "go.o")
 		if len(asms) > 0 {
 			cmd = []string{goTool(), "tool", "asm", "-e", "-I", ".", "-o", "asm.o"}
-			for _, file := range asms {
-				cmd = append(cmd, filepath.Join(longdir, file.Name()))
-			}
+			cmd = append(cmd, asms...)
 			_, err = runcmd(cmd...)
 			if err != nil {
 				t.err = err
@@ -844,9 +1058,7 @@ func (t *test) run() {
 				t.err = err
 				break
 			}
-			if strings.Replace(string(out), "\r\n", "\n", -1) != t.expectedOutput() {
-				t.err = fmt.Errorf("incorrect output\n%s", out)
-			}
+			t.checkExpectedOutput(out)
 		}
 
 	case "buildrun":
@@ -860,30 +1072,28 @@ func (t *test) run() {
 		longdirgofile := filepath.Join(filepath.Join(cwd, t.dir), t.gofile)
 		cmd = append(cmd, flags...)
 		cmd = append(cmd, longdirgofile)
-		out, err := runcmd(cmd...)
+		_, err := runcmd(cmd...)
 		if err != nil {
 			t.err = err
 			return
 		}
 		cmd = []string{"./a.exe"}
-		out, err = runcmd(append(cmd, args...)...)
+		out, err := runcmd(append(cmd, args...)...)
 		if err != nil {
 			t.err = err
 			return
 		}
 
-		if strings.Replace(string(out), "\r\n", "\n", -1) != t.expectedOutput() {
-			t.err = fmt.Errorf("incorrect output\n%s", out)
-		}
+		t.checkExpectedOutput(out)
 
 	case "run":
 		// Run Go file if no special go command flags are provided;
 		// otherwise build an executable and run it.
 		// Verify the output.
-		useTmp = false
+		runInDir = ""
 		var out []byte
 		var err error
-		if len(flags)+len(args) == 0 && goGcflags() == "" && !*linkshared {
+		if len(flags)+len(args) == 0 && goGcflagsIsEmpty() && !*linkshared && goarch == runtime.GOARCH && goos == runtime.GOOS {
 			// If we're not using special go command flags,
 			// skip all the go command machinery.
 			// This avoids any time the go command would
@@ -917,9 +1127,7 @@ func (t *test) run() {
 			t.err = err
 			return
 		}
-		if strings.Replace(string(out), "\r\n", "\n", -1) != t.expectedOutput() {
-			t.err = fmt.Errorf("incorrect output\n%s", out)
-		}
+		t.checkExpectedOutput(out)
 
 	case "runoutput":
 		// Run Go file and write its output into temporary Go file.
@@ -928,7 +1136,7 @@ func (t *test) run() {
 		defer func() {
 			<-rungatec
 		}()
-		useTmp = false
+		runInDir = ""
 		cmd := []string{goTool(), "run", goGcflags()}
 		if *linkshared {
 			cmd = append(cmd, "-linkshared")
@@ -954,14 +1162,12 @@ func (t *test) run() {
 			t.err = err
 			return
 		}
-		if string(out) != t.expectedOutput() {
-			t.err = fmt.Errorf("incorrect output\n%s", out)
-		}
+		t.checkExpectedOutput(out)
 
 	case "errorcheckoutput":
 		// Run Go file and write its output into temporary Go file.
 		// Compile and errorCheck generated Go file.
-		useTmp = false
+		runInDir = ""
 		cmd := []string{goTool(), "run", goGcflags()}
 		if *linkshared {
 			cmd = append(cmd, "-linkshared")
@@ -978,7 +1184,7 @@ func (t *test) run() {
 			t.err = fmt.Errorf("write tempfile:%s", err)
 			return
 		}
-		cmdline := []string{goTool(), "tool", "compile", "-e", "-o", "a.o"}
+		cmdline := []string{goTool(), "tool", "compile", "-d=panic", "-e", "-o", "a.o"}
 		cmdline = append(cmdline, flags...)
 		cmdline = append(cmdline, tfile)
 		out, err = runcmd(cmdline...)
@@ -1022,18 +1228,32 @@ func (t *test) String() string {
 func (t *test) makeTempDir() {
 	var err error
 	t.tempDir, err = ioutil.TempDir("", "")
-	check(err)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if *keep {
 		log.Printf("Temporary directory is %s", t.tempDir)
 	}
 }
 
-func (t *test) expectedOutput() string {
+// checkExpectedOutput compares the output from compiling and/or running with the contents
+// of the corresponding reference output file, if any (replace ".go" with ".out").
+// If they don't match, fail with an informative message.
+func (t *test) checkExpectedOutput(gotBytes []byte) {
+	got := string(gotBytes)
 	filename := filepath.Join(t.dir, t.gofile)
 	filename = filename[:len(filename)-len(".go")]
 	filename += ".out"
-	b, _ := ioutil.ReadFile(filename)
-	return string(b)
+	b, err := ioutil.ReadFile(filename)
+	// File is allowed to be missing (err != nil) in which case output should be empty.
+	got = strings.Replace(got, "\r\n", "\n", -1)
+	if got != string(b) {
+		if err == nil {
+			t.err = fmt.Errorf("output does not match expected in %s. Instead saw\n%s", filename, got)
+		} else {
+			t.err = fmt.Errorf("output should be empty when (optional) expected-output file %s is not present. Instead saw\n%s", filename, got)
+		}
+	}
 }
 
 func splitOutput(out string, wantAuto bool) []string {
@@ -1063,10 +1283,10 @@ func splitOutput(out string, wantAuto bool) []string {
 // this function will report an error.
 // Likewise if outStr does not have an error for a line which has a comment,
 // or if the error message does not match the <regexp>.
-// The <regexp> syntax is Perl but its best to stick to egrep.
+// The <regexp> syntax is Perl but it's best to stick to egrep.
 //
 // Sources files are supplied as fullshort slice.
-// It consists of pairs: full path to source file and it's base name.
+// It consists of pairs: full path to source file and its base name.
 func (t *test) errorCheck(outStr string, wantAuto bool, fullshort ...string) (err error) {
 	defer func() {
 		if *verbose && err != nil {
@@ -1180,7 +1400,7 @@ func (t *test) updateErrors(out, file string) {
 		msg := errStr[colon2+2:]
 		msg = strings.Replace(msg, file, base, -1) // normalize file mentions in error itself
 		msg = strings.TrimLeft(msg, " \t")
-		for _, r := range []string{`\`, `*`, `+`, `[`, `]`, `(`, `)`} {
+		for _, r := range []string{`\`, `*`, `+`, `?`, `[`, `]`, `(`, `)`} {
 			msg = strings.Replace(msg, r, `\`+r, -1)
 		}
 		msg = strings.Replace(msg, `"`, `.`, -1)
@@ -1343,15 +1563,16 @@ var (
 	// value[0] is the variant-changing environment variable, and values[1:]
 	// are the supported variants.
 	archVariants = map[string][]string{
-		"386":     {"GO386", "387", "sse2"},
+		"386":     {"GO386", "sse2", "softfloat"},
 		"amd64":   {},
 		"arm":     {"GOARM", "5", "6", "7"},
 		"arm64":   {},
 		"mips":    {"GOMIPS", "hardfloat", "softfloat"},
 		"mips64":  {"GOMIPS64", "hardfloat", "softfloat"},
-		"ppc64":   {},
-		"ppc64le": {},
+		"ppc64":   {"GOPPC64", "power8", "power9"},
+		"ppc64le": {"GOPPC64", "power8", "power9"},
 		"s390x":   {},
+		"wasm":    {},
 	}
 )
 
@@ -1430,6 +1651,9 @@ func (t *test) wantedAsmOpcodes(fn string) asmChecks {
 				os, arch, subarch = "linux", archspec[0], archspec[1][1:]
 			default: // 1 component: "386"
 				os, arch, subarch = "linux", archspec[0], ""
+				if arch == "wasm" {
+					os = "js"
+				}
 			}
 
 			if _, ok := archVariants[arch]; !ok {
@@ -1623,27 +1847,139 @@ func checkShouldTest() {
 	assert(shouldTest("// +build !windows !plan9", "windows", "amd64"))
 }
 
-// envForDir returns a copy of the environment
-// suitable for running in the given directory.
-// The environment is the current process's environment
-// but with an updated $PWD, so that an os.Getwd in the
-// child will be faster.
-func envForDir(dir string) []string {
-	env := os.Environ()
-	for i, kv := range env {
-		if strings.HasPrefix(kv, "PWD=") {
-			env[i] = "PWD=" + dir
-			return env
-		}
-	}
-	env = append(env, "PWD="+dir)
-	return env
-}
-
 func getenv(key, def string) string {
 	value := os.Getenv(key)
 	if value != "" {
 		return value
 	}
 	return def
+}
+
+// overlayDir makes a minimal-overhead copy of srcRoot in which new files may be added.
+func overlayDir(dstRoot, srcRoot string) error {
+	dstRoot = filepath.Clean(dstRoot)
+	if err := os.MkdirAll(dstRoot, 0777); err != nil {
+		return err
+	}
+
+	srcRoot, err := filepath.Abs(srcRoot)
+	if err != nil {
+		return err
+	}
+
+	return filepath.WalkDir(srcRoot, func(srcPath string, d fs.DirEntry, err error) error {
+		if err != nil || srcPath == srcRoot {
+			return err
+		}
+
+		suffix := strings.TrimPrefix(srcPath, srcRoot)
+		for len(suffix) > 0 && suffix[0] == filepath.Separator {
+			suffix = suffix[1:]
+		}
+		dstPath := filepath.Join(dstRoot, suffix)
+
+		var info fs.FileInfo
+		if d.Type()&os.ModeSymlink != 0 {
+			info, err = os.Stat(srcPath)
+		} else {
+			info, err = d.Info()
+		}
+		if err != nil {
+			return err
+		}
+		perm := info.Mode() & os.ModePerm
+
+		// Always copy directories (don't symlink them).
+		// If we add a file in the overlay, we don't want to add it in the original.
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, perm|0200)
+		}
+
+		// If the OS supports symlinks, use them instead of copying bytes.
+		if err := os.Symlink(srcPath, dstPath); err == nil {
+			return nil
+		}
+
+		// Otherwise, copy the bytes.
+		src, err := os.Open(srcPath)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+
+		dst, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+		if err != nil {
+			return err
+		}
+
+		_, err = io.Copy(dst, src)
+		if closeErr := dst.Close(); err == nil {
+			err = closeErr
+		}
+		return err
+	})
+}
+
+// List of files that the compiler cannot errorcheck with the new typechecker (compiler -G option).
+// Temporary scaffolding until we pass all the tests at which point this map can be removed.
+var excluded = map[string]bool{
+	"complit1.go":     true, // types2 reports extra errors
+	"const2.go":       true, // types2 not run after syntax errors
+	"ddd1.go":         true, // issue #42987
+	"directive.go":    true, // misplaced compiler directive checks
+	"float_lit3.go":   true, // types2 reports extra errors
+	"import1.go":      true, // types2 reports extra errors
+	"import5.go":      true, // issue #42988
+	"import6.go":      true, // issue #43109
+	"initializerr.go": true, // types2 reports extra errors
+	"linkname2.go":    true, // error reported by noder (not running for types2 errorcheck test)
+	"notinheap.go":    true, // types2 doesn't report errors about conversions that are invalid due to //go:notinheap
+	"shift1.go":       true, // issue #42989
+	"typecheck.go":    true, // invalid function is not causing errors when called
+	"writebarrier.go": true, // correct diagnostics, but different lines (probably irgen's fault)
+
+	"fixedbugs/bug176.go":    true, // types2 reports all errors (pref: types2)
+	"fixedbugs/bug193.go":    true, // types2 bug: shift error not reported (fixed in go/types)
+	"fixedbugs/bug195.go":    true, // types2 reports slightly different (but correct) bugs
+	"fixedbugs/bug228.go":    true, // types2 not run after syntax errors
+	"fixedbugs/bug231.go":    true, // types2 bug? (same error reported twice)
+	"fixedbugs/bug255.go":    true, // types2 reports extra errors
+	"fixedbugs/bug351.go":    true, // types2 reports extra errors
+	"fixedbugs/bug374.go":    true, // types2 reports extra errors
+	"fixedbugs/bug385_32.go": true, // types2 doesn't produce missing error "type .* too large" (32-bit specific)
+	"fixedbugs/bug388.go":    true, // types2 not run due to syntax errors
+	"fixedbugs/bug412.go":    true, // types2 produces a follow-on error
+
+	"fixedbugs/issue11590.go":  true, // types2 doesn't report a follow-on error (pref: types2)
+	"fixedbugs/issue11610.go":  true, // types2 not run after syntax errors
+	"fixedbugs/issue11614.go":  true, // types2 reports an extra error
+	"fixedbugs/issue13415.go":  true, // declared but not used conflict
+	"fixedbugs/issue14520.go":  true, // missing import path error by types2
+	"fixedbugs/issue16428.go":  true, // types2 reports two instead of one error
+	"fixedbugs/issue17038.go":  true, // types2 doesn't report a follow-on error (pref: types2)
+	"fixedbugs/issue17645.go":  true, // multiple errors on same line
+	"fixedbugs/issue18331.go":  true, // missing error about misuse of //go:noescape (irgen needs code from noder)
+	"fixedbugs/issue18393.go":  true, // types2 not run after syntax errors
+	"fixedbugs/issue19012.go":  true, // multiple errors on same line
+	"fixedbugs/issue20233.go":  true, // types2 reports two instead of one error (pref: compiler)
+	"fixedbugs/issue20245.go":  true, // types2 reports two instead of one error (pref: compiler)
+	"fixedbugs/issue20250.go":  true, // correct diagnostics, but different lines (probably irgen's fault)
+	"fixedbugs/issue21979.go":  true, // types2 doesn't report a follow-on error (pref: types2)
+	"fixedbugs/issue23732.go":  true, // types2 reports different (but ok) line numbers
+	"fixedbugs/issue25958.go":  true, // types2 doesn't report a follow-on error (pref: types2)
+	"fixedbugs/issue28079b.go": true, // types2 reports follow-on errors
+	"fixedbugs/issue28268.go":  true, // types2 reports follow-on errors
+	"fixedbugs/issue33460.go":  true, // types2 reports alternative positions in separate error
+	"fixedbugs/issue41575.go":  true, // types2 reports alternative positions in separate error
+	"fixedbugs/issue42058a.go": true, // types2 doesn't report "channel element type too large"
+	"fixedbugs/issue42058b.go": true, // types2 doesn't report "channel element type too large"
+	"fixedbugs/issue4232.go":   true, // types2 reports (correct) extra errors
+	"fixedbugs/issue4452.go":   true, // types2 reports (correct) extra errors
+	"fixedbugs/issue5609.go":   true, // types2 needs a better error message
+	"fixedbugs/issue6889.go":   true, // types2 can handle this without constant overflow
+	"fixedbugs/issue7525.go":   true, // types2 reports init cycle error on different line - ok otherwise
+	"fixedbugs/issue7525b.go":  true, // types2 reports init cycle error on different line - ok otherwise
+	"fixedbugs/issue7525c.go":  true, // types2 reports init cycle error on different line - ok otherwise
+	"fixedbugs/issue7525d.go":  true, // types2 reports init cycle error on different line - ok otherwise
+	"fixedbugs/issue7525e.go":  true, // types2 reports init cycle error on different line - ok otherwise
 }

@@ -490,7 +490,22 @@ func (r *StackRecord) Stack() []uintptr {
 // memory profiling rate should do so just once, as early as
 // possible in the execution of the program (for example,
 // at the beginning of main).
-var MemProfileRate int = 512 * 1024
+var MemProfileRate int = defaultMemProfileRate(512 * 1024)
+
+// defaultMemProfileRate returns 0 if disableMemoryProfiling is set.
+// It exists primarily for the godoc rendering of MemProfileRate
+// above.
+func defaultMemProfileRate(v int) int {
+	if disableMemoryProfiling {
+		return 0
+	}
+	return v
+}
+
+// disableMemoryProfiling is set by the linker if runtime.MemProfile
+// is not used and the link type guarantees nobody else could use it
+// elsewhere.
+var disableMemoryProfiling bool
 
 // A MemProfileRecord describes the live objects allocated
 // by a particular call sequence (stack trace).
@@ -711,33 +726,37 @@ func ThreadCreateProfile(p []StackRecord) (n int, ok bool) {
 	return
 }
 
-// GoroutineProfile returns n, the number of records in the active goroutine stack profile.
-// If len(p) >= n, GoroutineProfile copies the profile into p and returns n, true.
-// If len(p) < n, GoroutineProfile does not change p and returns n, false.
-//
-// Most clients should use the runtime/pprof package instead
-// of calling GoroutineProfile directly.
-func GoroutineProfile(p []StackRecord) (n int, ok bool) {
+//go:linkname runtime_goroutineProfileWithLabels runtime/pprof.runtime_goroutineProfileWithLabels
+func runtime_goroutineProfileWithLabels(p []StackRecord, labels []unsafe.Pointer) (n int, ok bool) {
+	return goroutineProfileWithLabels(p, labels)
+}
+
+// labels may be nil. If labels is non-nil, it must have the same length as p.
+func goroutineProfileWithLabels(p []StackRecord, labels []unsafe.Pointer) (n int, ok bool) {
+	if labels != nil && len(labels) != len(p) {
+		labels = nil
+	}
 	gp := getg()
 
 	isOK := func(gp1 *g) bool {
 		// Checking isSystemGoroutine here makes GoroutineProfile
 		// consistent with both NumGoroutine and Stack.
-		return gp1 != gp && readgstatus(gp1) != _Gdead && !isSystemGoroutine(gp1)
+		return gp1 != gp && readgstatus(gp1) != _Gdead && !isSystemGoroutine(gp1, false)
 	}
 
 	stopTheWorld("profile")
 
+	// World is stopped, no locking required.
 	n = 1
-	for _, gp1 := range allgs {
+	forEachGRace(func(gp1 *g) {
 		if isOK(gp1) {
 			n++
 		}
-	}
+	})
 
 	if n <= len(p) {
 		ok = true
-		r := p
+		r, lbl := p, labels
 
 		// Save current goroutine.
 		sp := getcallersp()
@@ -747,23 +766,45 @@ func GoroutineProfile(p []StackRecord) (n int, ok bool) {
 		})
 		r = r[1:]
 
-		// Save other goroutines.
-		for _, gp1 := range allgs {
-			if isOK(gp1) {
-				if len(r) == 0 {
-					// Should be impossible, but better to return a
-					// truncated profile than to crash the entire process.
-					break
-				}
-				saveg(^uintptr(0), ^uintptr(0), gp1, &r[0])
-				r = r[1:]
-			}
+		// If we have a place to put our goroutine labelmap, insert it there.
+		if labels != nil {
+			lbl[0] = gp.labels
+			lbl = lbl[1:]
 		}
+
+		// Save other goroutines.
+		forEachGRace(func(gp1 *g) {
+			if !isOK(gp1) {
+				return
+			}
+
+			if len(r) == 0 {
+				// Should be impossible, but better to return a
+				// truncated profile than to crash the entire process.
+				return
+			}
+			saveg(^uintptr(0), ^uintptr(0), gp1, &r[0])
+			if labels != nil {
+				lbl[0] = gp1.labels
+				lbl = lbl[1:]
+			}
+			r = r[1:]
+		})
 	}
 
 	startTheWorld()
-
 	return n, ok
+}
+
+// GoroutineProfile returns n, the number of records in the active goroutine stack profile.
+// If len(p) >= n, GoroutineProfile copies the profile into p and returns n, true.
+// If len(p) < n, GoroutineProfile does not change p and returns n, false.
+//
+// Most clients should use the runtime/pprof package instead
+// of calling GoroutineProfile directly.
+func GoroutineProfile(p []StackRecord) (n int, ok bool) {
+
+	return goroutineProfileWithLabels(p, nil)
 }
 
 func saveg(pc, sp uintptr, gp *g, r *StackRecord) {

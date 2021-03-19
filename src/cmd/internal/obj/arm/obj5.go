@@ -1,5 +1,5 @@
 // Derived from Inferno utils/5c/swt.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/5c/swt.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/5c/swt.c
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -34,6 +34,7 @@ import (
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
+	"log"
 )
 
 var progedit_tlsfallback *obj.LSym
@@ -249,13 +250,13 @@ const (
 func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 	autosize := int32(0)
 
-	if cursym.Func.Text == nil || cursym.Func.Text.Link == nil {
+	if cursym.Func().Text == nil || cursym.Func().Text.Link == nil {
 		return
 	}
 
 	c := ctxt5{ctxt: ctxt, cursym: cursym, newprog: newprog}
 
-	p := c.cursym.Func.Text
+	p := c.cursym.Func().Text
 	autoffset := int32(p.To.Offset)
 	if autoffset == -4 {
 		// Historical way to mark NOFRAME.
@@ -271,76 +272,30 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 		}
 	}
 
-	cursym.Func.Locals = autoffset
-	cursym.Func.Args = p.To.Val.(int32)
+	cursym.Func().Locals = autoffset
+	cursym.Func().Args = p.To.Val.(int32)
 
 	/*
 	 * find leaf subroutines
-	 * strip NOPs
-	 * expand RET
-	 * expand BECOME pseudo
 	 */
-	var q1 *obj.Prog
-	var q *obj.Prog
-	for p := cursym.Func.Text; p != nil; p = p.Link {
+	for p := cursym.Func().Text; p != nil; p = p.Link {
 		switch p.As {
 		case obj.ATEXT:
 			p.Mark |= LEAF
 
-		case obj.ARET:
-			break
-
 		case ADIV, ADIVU, AMOD, AMODU:
-			q = p
-			cursym.Func.Text.Mark &^= LEAF
-			continue
-
-		case obj.ANOP:
-			q1 = p.Link
-			q.Link = q1 /* q is non-nop */
-			if q1 != nil {
-				q1.Mark |= p.Mark
-			}
-			continue
+			cursym.Func().Text.Mark &^= LEAF
 
 		case ABL,
 			ABX,
 			obj.ADUFFZERO,
 			obj.ADUFFCOPY:
-			cursym.Func.Text.Mark &^= LEAF
-			fallthrough
-
-		case AB,
-			ABEQ,
-			ABNE,
-			ABCS,
-			ABHS,
-			ABCC,
-			ABLO,
-			ABMI,
-			ABPL,
-			ABVS,
-			ABVC,
-			ABHI,
-			ABLS,
-			ABGE,
-			ABLT,
-			ABGT,
-			ABLE:
-			q1 = p.Pcond
-			if q1 != nil {
-				for q1.As == obj.ANOP {
-					q1 = q1.Link
-					p.Pcond = q1
-				}
-			}
+			cursym.Func().Text.Mark &^= LEAF
 		}
-
-		q = p
 	}
 
 	var q2 *obj.Prog
-	for p := cursym.Func.Text; p != nil; p = p.Link {
+	for p := cursym.Func().Text; p != nil; p = p.Link {
 		o := p.As
 		switch o {
 		case obj.ATEXT:
@@ -357,20 +312,20 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				autosize += 4
 			}
 
-			if autosize == 0 && cursym.Func.Text.Mark&LEAF == 0 {
+			if autosize == 0 && cursym.Func().Text.Mark&LEAF == 0 {
 				// A very few functions that do not return to their caller
 				// are not identified as leaves but still have no frame.
 				if ctxt.Debugvlog {
 					ctxt.Logf("save suppressed in: %s\n", cursym.Name)
 				}
 
-				cursym.Func.Text.Mark |= LEAF
+				cursym.Func().Text.Mark |= LEAF
 			}
 
 			// FP offsets need an updated p.To.Offset.
 			p.To.Offset = int64(autosize) - 4
 
-			if cursym.Func.Text.Mark&LEAF != 0 {
+			if cursym.Func().Text.Mark&LEAF != 0 {
 				cursym.Set(obj.AttrLeaf, true)
 				if p.From.Sym.NoFrame() {
 					break
@@ -393,7 +348,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 			p.To.Reg = REGSP
 			p.Spadj = autosize
 
-			if cursym.Func.Text.From.Sym.Wrapper() {
+			if cursym.Func().Text.From.Sym.Wrapper() {
 				// if(g->panic != nil && g->panic->argp == FP) g->panic->argp = bottom-of-frame
 				//
 				//	MOVW g_panic(g), R1
@@ -452,7 +407,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				mov.To.Reg = REG_R2
 
 				// B.NE branch target is MOVW above
-				bne.Pcond = mov
+				bne.To.SetTarget(mov)
 
 				// ADD $(autosize+4), R13, R3
 				p = obj.Appendp(mov, newprog)
@@ -474,7 +429,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				p = obj.Appendp(p, newprog)
 				p.As = ABNE
 				p.To.Type = obj.TYPE_BRANCH
-				p.Pcond = end
+				p.To.SetTarget(end)
 
 				// ADD $4, R13, R4
 				p = obj.Appendp(p, newprog)
@@ -498,7 +453,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				p = obj.Appendp(p, newprog)
 				p.As = AB
 				p.To.Type = obj.TYPE_BRANCH
-				p.Pcond = end
+				p.To.SetTarget(end)
 
 				// reset for subsequent passes
 				p = end
@@ -506,7 +461,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 
 		case obj.ARET:
 			nocache(p)
-			if cursym.Func.Text.Mark&LEAF != 0 {
+			if cursym.Func().Text.Mark&LEAF != 0 {
 				if autosize == 0 {
 					p.As = AB
 					p.From = obj.Addr{}
@@ -533,6 +488,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 			// If there are instructions following
 			// this ARET, they come from a branch
 			// with the same stackframe, so no spadj.
+
 			if p.To.Sym != nil { // retjmp
 				p.To.Reg = REGLINK
 				q2 = obj.Appendp(p, newprog)
@@ -540,6 +496,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				q2.To.Type = obj.TYPE_BRANCH
 				q2.To.Sym = p.To.Sym
 				p.To.Sym = nil
+				p.To.Name = obj.NAME_NONE
 				p = q2
 			}
 
@@ -554,7 +511,7 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 			}
 
 		case ADIV, ADIVU, AMOD, AMODU:
-			if cursym.Func.Text.From.Sym.NoSplit() {
+			if cursym.Func().Text.From.Sym.NoSplit() {
 				ctxt.Diag("cannot divide in NOSPLIT function")
 			}
 			const debugdivmod = false
@@ -657,6 +614,21 @@ func preprocess(ctxt *obj.Link, cursym *obj.LSym, newprog obj.ProgAlloc) {
 				p.From.Reg = REGSP
 			}
 		}
+
+		if p.To.Type == obj.TYPE_REG && p.To.Reg == REGSP && p.Spadj == 0 {
+			f := c.cursym.Func()
+			if f.FuncFlag&objabi.FuncFlag_SPWRITE == 0 {
+				c.cursym.Func().FuncFlag |= objabi.FuncFlag_SPWRITE
+				if ctxt.Debugvlog || !ctxt.IsAsm {
+					ctxt.Logf("auto-SPWRITE: %s %v\n", c.cursym.Name, p)
+					if !ctxt.IsAsm {
+						ctxt.Diag("invalid auto-SPWRITE in non-assembly")
+						ctxt.DiagFlush()
+						log.Fatalf("bad SPWRITE")
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -673,6 +645,12 @@ func (c *ctxt5) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 	}
 	p.To.Type = obj.TYPE_REG
 	p.To.Reg = REG_R1
+
+	// Mark the stack bound check and morestack call async nonpreemptible.
+	// If we get preempted here, when resumed the preemption request is
+	// cleared, but we'll still call morestack, which will double the stack
+	// unnecessarily. See issue #35470.
+	p = c.ctxt.StartUnsafePoint(p, c.newprog)
 
 	if framesize <= objabi.StackSmall {
 		// small stack: SP < stackguard
@@ -723,7 +701,7 @@ func (c *ctxt5) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 		p.As = AMOVW
 		p.From.Type = obj.TYPE_ADDR
 		p.From.Reg = REGSP
-		p.From.Offset = objabi.StackGuard
+		p.From.Offset = int64(objabi.StackGuard)
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = REG_R2
 		p.Scond = C_SCOND_NE
@@ -739,7 +717,7 @@ func (c *ctxt5) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 		p = obj.Appendp(p, c.newprog)
 		p.As = AMOVW
 		p.From.Type = obj.TYPE_ADDR
-		p.From.Offset = int64(framesize) + (objabi.StackGuard - objabi.StackSmall)
+		p.From.Offset = int64(framesize) + (int64(objabi.StackGuard) - objabi.StackSmall)
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = REG_R3
 		p.Scond = C_SCOND_NE
@@ -757,8 +735,10 @@ func (c *ctxt5) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 	bls.As = ABLS
 	bls.To.Type = obj.TYPE_BRANCH
 
+	end := c.ctxt.EndUnsafePoint(bls, c.newprog, -1)
+
 	var last *obj.Prog
-	for last = c.cursym.Func.Text; last.Link != nil; last = last.Link {
+	for last = c.cursym.Func().Text; last.Link != nil; last = last.Link {
 	}
 
 	// Now we are at the end of the function, but logically
@@ -768,7 +748,8 @@ func (c *ctxt5) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 	spfix.As = obj.ANOP
 	spfix.Spadj = -framesize
 
-	pcdata := c.ctxt.EmitEntryLiveness(c.cursym, spfix, c.newprog)
+	pcdata := c.ctxt.EmitEntryStackMap(c.cursym, spfix, c.newprog)
+	pcdata = c.ctxt.StartUnsafePoint(pcdata, c.newprog)
 
 	// MOVW	LR, R3
 	movw := obj.Appendp(pcdata, c.newprog)
@@ -778,7 +759,7 @@ func (c *ctxt5) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 	movw.To.Type = obj.TYPE_REG
 	movw.To.Reg = REG_R3
 
-	bls.Pcond = movw
+	bls.To.SetTarget(movw)
 
 	// BL runtime.morestack
 	call := obj.Appendp(movw, c.newprog)
@@ -788,19 +769,21 @@ func (c *ctxt5) stacksplit(p *obj.Prog, framesize int32) *obj.Prog {
 	switch {
 	case c.cursym.CFunc():
 		morestack = "runtime.morestackc"
-	case !c.cursym.Func.Text.From.Sym.NeedCtxt():
+	case !c.cursym.Func().Text.From.Sym.NeedCtxt():
 		morestack = "runtime.morestack_noctxt"
 	}
 	call.To.Sym = c.ctxt.Lookup(morestack)
 
+	pcdata = c.ctxt.EndUnsafePoint(call, c.newprog, -1)
+
 	// B start
-	b := obj.Appendp(call, c.newprog)
+	b := obj.Appendp(pcdata, c.newprog)
 	b.As = obj.AJMP
 	b.To.Type = obj.TYPE_BRANCH
-	b.Pcond = c.cursym.Func.Text.Link
+	b.To.SetTarget(c.cursym.Func().Text.Link)
 	b.Spadj = +framesize
 
-	return bls
+	return end
 }
 
 var unaryDst = map[obj.As]bool{

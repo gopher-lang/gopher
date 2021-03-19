@@ -7,7 +7,6 @@ package json
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -90,6 +89,18 @@ func TestEncoderIndent(t *testing.T) {
 	}
 }
 
+type strMarshaler string
+
+func (s strMarshaler) MarshalJSON() ([]byte, error) {
+	return []byte(s), nil
+}
+
+type strPtrMarshaler string
+
+func (s *strPtrMarshaler) MarshalJSON() ([]byte, error) {
+	return []byte(*s), nil
+}
+
 func TestEncoderSetEscapeHTML(t *testing.T) {
 	var c C
 	var ct CText
@@ -97,6 +108,20 @@ func TestEncoderSetEscapeHTML(t *testing.T) {
 		Valid   int `json:"<>&#! "`
 		Invalid int `json:"\\"`
 	}
+
+	// This case is particularly interesting, as we force the encoder to
+	// take the address of the Ptr field to use its MarshalJSON method. This
+	// is why the '&' is important.
+	marshalerStruct := &struct {
+		NonPtr strMarshaler
+		Ptr    strPtrMarshaler
+	}{`"<str>"`, `"<str>"`}
+
+	// https://golang.org/issue/34154
+	stringOption := struct {
+		Bar string `json:"bar,string"`
+	}{`<html>foobar</html>`}
+
 	for _, tt := range []struct {
 		name       string
 		v          interface{}
@@ -111,11 +136,22 @@ func TestEncoderSetEscapeHTML(t *testing.T) {
 			`{"\u003c\u003e\u0026#! ":0,"Invalid":0}`,
 			`{"<>&#! ":0,"Invalid":0}`,
 		},
+		{
+			`"<str>"`, marshalerStruct,
+			`{"NonPtr":"\u003cstr\u003e","Ptr":"\u003cstr\u003e"}`,
+			`{"NonPtr":"<str>","Ptr":"<str>"}`,
+		},
+		{
+			"stringOption", stringOption,
+			`{"bar":"\"\\u003chtml\\u003efoobar\\u003c/html\\u003e\""}`,
+			`{"bar":"\"<html>foobar</html>\""}`,
+		},
 	} {
 		var buf bytes.Buffer
 		enc := NewEncoder(&buf)
 		if err := enc.Encode(tt.v); err != nil {
-			t.Fatalf("Encode(%s): %s", tt.name, err)
+			t.Errorf("Encode(%s): %s", tt.name, err)
+			continue
 		}
 		if got := strings.TrimSpace(buf.String()); got != tt.wantEscape {
 			t.Errorf("Encode(%s) = %#q, want %#q", tt.name, got, tt.wantEscape)
@@ -123,7 +159,8 @@ func TestEncoderSetEscapeHTML(t *testing.T) {
 		buf.Reset()
 		enc.SetEscapeHTML(false)
 		if err := enc.Encode(tt.v); err != nil {
-			t.Fatalf("SetEscapeHTML(false) Encode(%s): %s", tt.name, err)
+			t.Errorf("SetEscapeHTML(false) Encode(%s): %s", tt.name, err)
+			continue
 		}
 		if got := strings.TrimSpace(buf.String()); got != tt.want {
 			t.Errorf("SetEscapeHTML(false) Encode(%s) = %#q, want %#q",
@@ -177,7 +214,7 @@ func TestDecoderBuffered(t *testing.T) {
 	if m.Name != "Gopher" {
 		t.Errorf("Name = %q; want Gopher", m.Name)
 	}
-	rest, err := ioutil.ReadAll(d.Buffered())
+	rest, err := io.ReadAll(d.Buffered())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +317,7 @@ func BenchmarkEncoderEncode(b *testing.B) {
 	v := &T{"foo", "bar"}
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if err := NewEncoder(ioutil.Discard).Encode(v); err != nil {
+			if err := NewEncoder(io.Discard).Encode(v); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -296,7 +333,7 @@ type decodeThis struct {
 	v interface{}
 }
 
-var tokenStreamCases []tokenStreamCase = []tokenStreamCase{
+var tokenStreamCases = []tokenStreamCase{
 	// streaming token cases
 	{json: `10`, expTokens: []interface{}{float64(10)}},
 	{json: ` [10] `, expTokens: []interface{}{
@@ -368,7 +405,6 @@ var tokenStreamCases []tokenStreamCase = []tokenStreamCase{
 }
 
 func TestDecodeInStream(t *testing.T) {
-
 	for ci, tcase := range tokenStreamCases {
 
 		dec := NewDecoder(strings.NewReader(tcase.json))
@@ -401,7 +437,6 @@ func TestDecodeInStream(t *testing.T) {
 			}
 		}
 	}
-
 }
 
 // Test from golang.org/issue/11893

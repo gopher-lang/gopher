@@ -67,7 +67,7 @@ var writeSetCookiesTests = []struct {
 	},
 	{
 		&Cookie{Name: "cookie-12", Value: "samesite-default", SameSite: SameSiteDefaultMode},
-		"cookie-12=samesite-default; SameSite",
+		"cookie-12=samesite-default",
 	},
 	{
 		&Cookie{Name: "cookie-13", Value: "samesite-lax", SameSite: SameSiteLaxMode},
@@ -76,6 +76,10 @@ var writeSetCookiesTests = []struct {
 	{
 		&Cookie{Name: "cookie-14", Value: "samesite-strict", SameSite: SameSiteStrictMode},
 		"cookie-14=samesite-strict; SameSite=Strict",
+	},
+	{
+		&Cookie{Name: "cookie-15", Value: "samesite-none", SameSite: SameSiteNoneMode},
+		"cookie-15=samesite-none; SameSite=None",
 	},
 	// The "special" cookies have values containing commas or spaces which
 	// are disallowed by RFC 6265 but are common in the wild.
@@ -125,6 +129,22 @@ var writeSetCookiesTests = []struct {
 	},
 	{
 		&Cookie{Name: "\t"},
+		``,
+	},
+	{
+		&Cookie{Name: "\r"},
+		``,
+	},
+	{
+		&Cookie{Name: "a\nb", Value: "v"},
+		``,
+	},
+	{
+		&Cookie{Name: "a\nb", Value: "v"},
+		``,
+	},
+	{
+		&Cookie{Name: "a\rb", Value: "v"},
 		``,
 	},
 }
@@ -263,6 +283,15 @@ var readSetCookiesTests = []struct {
 		}},
 	},
 	{
+		Header{"Set-Cookie": {"samesiteinvalidisdefault=foo; SameSite=invalid"}},
+		[]*Cookie{{
+			Name:     "samesiteinvalidisdefault",
+			Value:    "foo",
+			SameSite: SameSiteDefaultMode,
+			Raw:      "samesiteinvalidisdefault=foo; SameSite=invalid",
+		}},
+	},
+	{
 		Header{"Set-Cookie": {"samesitelax=foo; SameSite=Lax"}},
 		[]*Cookie{{
 			Name:     "samesitelax",
@@ -278,6 +307,15 @@ var readSetCookiesTests = []struct {
 			Value:    "foo",
 			SameSite: SameSiteStrictMode,
 			Raw:      "samesitestrict=foo; SameSite=Strict",
+		}},
+	},
+	{
+		Header{"Set-Cookie": {"samesitenone=foo; SameSite=None"}},
+		[]*Cookie{{
+			Name:     "samesitenone",
+			Value:    "foo",
+			SameSite: SameSiteNoneMode,
+			Raw:      "samesitenone=foo; SameSite=None",
 		}},
 	},
 	// Make sure we can properly read back the Set-Cookie headers we create
@@ -384,6 +422,19 @@ var readCookiesTests = []struct {
 			{Name: "Cookie-1", Value: "v$1"},
 			{Name: "c2", Value: "v2"},
 		},
+	},
+	{
+		Header{"Cookie": {`Cookie-1="v$1"; c2=v2;`}},
+		"",
+		[]*Cookie{
+			{Name: "Cookie-1", Value: "v$1"},
+			{Name: "c2", Value: "v2"},
+		},
+	},
+	{
+		Header{"Cookie": {``}},
+		"",
+		[]*Cookie{},
 	},
 }
 

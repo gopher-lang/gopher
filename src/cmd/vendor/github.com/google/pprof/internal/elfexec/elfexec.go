@@ -178,8 +178,7 @@ func GetBase(fh *elf.FileHeader, loadSegment *elf.ProgHeader, stextOffset *uint6
 		pageOffsetPpc64 = 0xc000000000000000
 	)
 
-	if start == 0 && offset == 0 &&
-		(limit == ^uint64(0) || limit == 0) {
+	if start == 0 && offset == 0 && (limit == ^uint64(0) || limit == 0) {
 		// Some tools may introduce a fake mapping that spans the entire
 		// address space. Assume that the address has already been
 		// adjusted, so no additional base adjustment is necessary.
@@ -189,8 +188,23 @@ func GetBase(fh *elf.FileHeader, loadSegment *elf.ProgHeader, stextOffset *uint6
 	switch fh.Type {
 	case elf.ET_EXEC:
 		if loadSegment == nil {
-			// Fixed-address executable, no adjustment.
+			// Assume fixed-address executable and so no adjustment.
 			return 0, nil
+		}
+		if stextOffset == nil && start > 0 && start < 0x8000000000000000 {
+			// A regular user-mode executable. Compute the base offset using same
+			// arithmetics as in ET_DYN case below, see the explanation there.
+			// Ideally, the condition would just be "stextOffset == nil" as that
+			// represents the address of _stext symbol in the vmlinux image. Alas,
+			// the caller may skip reading it from the binary (it's expensive to scan
+			// all the symbols) and so it may be nil even for the kernel executable.
+			// So additionally check that the start is within the user-mode half of
+			// the 64-bit address space.
+			return start - offset + loadSegment.Off - loadSegment.Vaddr, nil
+		}
+		// Various kernel heuristics and cases follow.
+		if loadSegment.Vaddr == start-offset {
+			return offset, nil
 		}
 		if start == 0 && limit != 0 {
 			// ChromeOS remaps its kernel to 0. Nothing else should come
@@ -201,12 +215,6 @@ func GetBase(fh *elf.FileHeader, loadSegment *elf.ProgHeader, stextOffset *uint6
 				return -*stextOffset, nil
 			}
 			return -loadSegment.Vaddr, nil
-		}
-		if loadSegment.Vaddr-loadSegment.Off == start-offset {
-			return offset, nil
-		}
-		if loadSegment.Vaddr == start-offset {
-			return offset, nil
 		}
 		if start >= loadSegment.Vaddr && limit > start && (offset == 0 || offset == pageOffsetPpc64 || offset == start) {
 			// Some kernels look like:
@@ -230,13 +238,13 @@ func GetBase(fh *elf.FileHeader, loadSegment *elf.ProgHeader, stextOffset *uint6
 			//       start=0x198 limit=0x2f9fffff offset=0
 			//       VADDR=0xffffffff81000000
 			// stextOffset=0xffffffff81000198
-			return -(*stextOffset - start), nil
+			return start - *stextOffset, nil
 		}
 
-		return 0, fmt.Errorf("Don't know how to handle EXEC segment: %v start=0x%x limit=0x%x offset=0x%x", *loadSegment, start, limit, offset)
+		return 0, fmt.Errorf("don't know how to handle EXEC segment: %v start=0x%x limit=0x%x offset=0x%x", *loadSegment, start, limit, offset)
 	case elf.ET_REL:
 		if offset != 0 {
-			return 0, fmt.Errorf("Don't know how to handle mapping.Offset")
+			return 0, fmt.Errorf("don't know how to handle mapping.Offset")
 		}
 		return start, nil
 	case elf.ET_DYN:
@@ -257,7 +265,7 @@ func GetBase(fh *elf.FileHeader, loadSegment *elf.ProgHeader, stextOffset *uint6
 		// sx = x - start + offset - loadSegment.Off + loadSegment.Vaddr.
 		return start - offset + loadSegment.Off - loadSegment.Vaddr, nil
 	}
-	return 0, fmt.Errorf("Don't know how to handle FileHeader.Type %v", fh.Type)
+	return 0, fmt.Errorf("don't know how to handle FileHeader.Type %v", fh.Type)
 }
 
 // FindTextProgHeader finds the program segment header containing the .text
@@ -274,4 +282,85 @@ func FindTextProgHeader(f *elf.File) *elf.ProgHeader {
 		}
 	}
 	return nil
+}
+
+// FindProgHeaderForMapping returns the loadable program segment header that is
+// fully contained in the runtime mapping with file offset pgoff and memory size
+// memsz, or an error if the segment cannot be determined. The function returns
+// a nil program header and no error if the ELF binary has no loadable segments.
+func FindProgHeaderForMapping(f *elf.File, pgoff, memsz uint64) (*elf.ProgHeader, error) {
+	var headers []*elf.ProgHeader
+	loadables := 0
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_LOAD && pgoff <= p.Off && p.Off+p.Memsz <= pgoff+memsz {
+			headers = append(headers, &p.ProgHeader)
+		}
+		if p.Type == elf.PT_LOAD {
+			loadables++
+		}
+	}
+	if len(headers) == 1 {
+		return headers[0], nil
+	}
+	// Some ELF files don't contain any program segments, e.g. .ko loadable kernel
+	// modules. Don't return an error in such cases.
+	if loadables == 0 {
+		return nil, nil
+	}
+	if len(headers) == 0 {
+		return nil, fmt.Errorf("no program header matches file offset %x and memory size %x", pgoff, memsz)
+	}
+
+	// Segments are mapped page aligned. In some cases, segments may be smaller
+	// than a page, which causes the next segment to start at a file offset that
+	// is logically on the same page if we were to align file offsets by page.
+	// Example:
+	//  LOAD           0x0000000000000000 0x0000000000400000 0x0000000000400000
+	//                 0x00000000000006fc 0x00000000000006fc  R E    0x200000
+	//  LOAD           0x0000000000000e10 0x0000000000600e10 0x0000000000600e10
+	//                 0x0000000000000230 0x0000000000000238  RW     0x200000
+	//
+	// In this case, perf records the following mappings for this executable:
+	// 0 0 [0xc0]: PERF_RECORD_MMAP2 87867/87867: [0x400000(0x1000) @ 0 00:3c 512041 0]: r-xp exename
+	// 0 0 [0xc0]: PERF_RECORD_MMAP2 87867/87867: [0x600000(0x2000) @ 0 00:3c 512041 0]: rw-p exename
+	//
+	// Both mappings have file offset 0. The first mapping is one page length and
+	// it can include only the first loadable segment. Due to page alignment, the
+	// second mapping starts also at file offset 0, and it spans two pages. It can
+	// include both the first and the second loadable segments. We must return the
+	// correct program header to compute the correct base offset.
+	//
+	// We cannot use the mapping protections to distinguish between segments,
+	// because protections are not passed through to this function.
+	// We cannot use the start address to differentiate between segments, because
+	// with ASLR, the mapping start address can be any value.
+	//
+	// We use a heuristic to compute the minimum mapping size required for a
+	// segment, assuming mappings are 4k page aligned, and return the segment that
+	// matches the given mapping size.
+	const pageSize = 4096
+
+	// The memory size based heuristic makes sense only if the mapping size is a
+	// multiple of 4k page size.
+	if memsz%pageSize != 0 {
+		return nil, fmt.Errorf("mapping size = %x and %d segments match the passed in mapping", memsz, len(headers))
+	}
+
+	// Return an error if no segment, or multiple segments match the size, so we can debug.
+	var ph *elf.ProgHeader
+	pageMask := ^uint64(pageSize - 1)
+	for _, h := range headers {
+		wantSize := (h.Vaddr+h.Memsz+pageSize-1)&pageMask - (h.Vaddr & pageMask)
+		if wantSize != memsz {
+			continue
+		}
+		if ph != nil {
+			return nil, fmt.Errorf("found second program header (%#v) that matches memsz %x, first program header is %#v", *h, memsz, *ph)
+		}
+		ph = h
+	}
+	if ph == nil {
+		return nil, fmt.Errorf("found %d matching program headers, but none matches mapping size %x", len(headers), memsz)
+	}
+	return ph, nil
 }

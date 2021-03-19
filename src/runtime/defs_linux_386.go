@@ -7,6 +7,7 @@ const (
 	_EINTR  = 0x4
 	_EAGAIN = 0xb
 	_ENOMEM = 0xc
+	_ENOSYS = 0x26
 
 	_PROT_NONE  = 0x0
 	_PROT_READ  = 0x1
@@ -78,8 +79,9 @@ const (
 	_ITIMER_VIRTUAL = 0x1
 	_ITIMER_PROF    = 0x2
 
-	_O_RDONLY  = 0x0
-	_O_CLOEXEC = 0x80000
+	_O_RDONLY   = 0x0
+	_O_NONBLOCK = 0x800
+	_O_CLOEXEC  = 0x80000
 
 	_EPOLLIN       = 0x1
 	_EPOLLOUT      = 0x4
@@ -93,7 +95,6 @@ const (
 	_EPOLL_CTL_MOD = 0x3
 
 	_AF_UNIX    = 0x1
-	_F_SETFL    = 0x4
 	_SOCK_DGRAM = 0x2
 )
 
@@ -137,12 +138,9 @@ type timespec struct {
 	tv_nsec int32
 }
 
-func (ts *timespec) set_sec(x int64) {
-	ts.tv_sec = int32(x)
-}
-
-func (ts *timespec) set_nsec(x int32) {
-	ts.tv_nsec = x
+//go:nosplit
+func (ts *timespec) setNsec(ns int64) {
+	ts.tv_sec = timediv(ns, 1e9, &ts.tv_nsec)
 }
 
 type timeval struct {

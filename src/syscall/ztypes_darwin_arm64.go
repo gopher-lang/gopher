@@ -1,6 +1,7 @@
 // Created by cgo -godefs - DO NOT EDIT
 // cgo -godefs types_darwin.go
 
+//go:build arm64 && darwin
 // +build arm64,darwin
 
 package syscall
@@ -150,6 +151,10 @@ type Dirent struct {
 	Name      [1024]int8
 	Pad_cgo_0 [3]byte
 }
+
+const (
+	pathMax = 0x400
+)
 
 type RawSockaddrInet4 struct {
 	Len    uint8
